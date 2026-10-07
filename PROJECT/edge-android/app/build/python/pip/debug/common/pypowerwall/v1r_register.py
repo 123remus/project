@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+"""
+Tesla RSA Key Registration for Powerwall LAN TEDapi v1r
+
+Generates an RSA-4096 key pair, registers it with the Powerwall via
+Tesla Owner API (recommended) or Fleet API OAuth, and saves the
+private key for use with pypowerwall's v1r LAN mode.
+
+Two authentication paths are supported:
+
+  Owner API (recommended — no developer app needed):
+    Just your Tesla account email and password, same login as
+    'python -m pypowerwall setup' (Cloud Mode).
+    python -m pypowerwall register
+
+  Fleet API (requires a Tesla developer app):
+    Needs CLIENT_ID, CLIENT_SECRET, and a hosted redirect URI.
+    See https://developer.tesla.com/ to set up an app first.
+    Credentials can be passed via environment variables:
+      export TESLA_CLIENT_ID="your-client-id"
+      export TESLA_CLIENT_SECRET="your-client-secret"
+      export TESLA_REDIRECT_URI="https://your-domain.com/callback"
+    python -m pypowerwall register
+"""
+
+import hashlib
+import json
+import os
+import sys
+import ssl
+import time
+import base64
+import urllib.request
+import urllib.parse
+import secrets
+
+# ── Configuration ──
+# Read from env vars first, prompt interactively if missing
+AUTH_BASE = "https://auth.tesla.com"
+TOKEN_BASE = "https://fleet-auth.prd.vn.cloud.tesla.com"
+SCOPE = "openid offline_access energy_device_data energy_cmds"
+OWNER_API_BASE = "https://owner-api.teslamotors.com"
+OWNER_AUTHFILE = ".pypowerwall.auth"  # Shared with Cloud Mode
+
+CERT_DIR = os.getcwd()
+
+# Fleet API region endpoints
+FLEET_REGIONS = {
+    "na":     "https://fleet-api.prd.na.vn.cloud.tesla.com",
+    "eu":     "https://fleet-api.prd.eu.vn.cloud.tesla.com",
+    "cn":     "https://fleet-api.prd.cn.vn.cloud.tesla.com",
+}
+
+
+def get_config():
+    """Get OAuth credentials from env vars or interactive prompts."""
+    client_id = os.getenv("TESLA_CLIENT_ID", "")
+    client_secret = os.getenv("TESLA_CLIENT_SECRET", "")
+    redirect_uri = os.getenv("TESLA_REDIRECT_URI", "")
+    fleet_api_base = os.getenv("TESLA_FLEET_API_BASE", "")
+
+    if client_id and client_secret and redirect_uri:
+        if not fleet_api_base:
+            fleet_api_base = FLEET_REGIONS["na"]
+        return client_id, client_secret, redirect_uri, fleet_api_base
+
+    # Interactive mode
+    print("=" * 70)
+    print("  Tesla Fleet API — RSA Key Registration")
+    print("=" * 70)
+    print()
+    print("No credentials found in environment variables.")
+    print("Enter your Tesla developer app credentials below.")
+    print()
+    print("Don't have these yet? Go to https://developer.tesla.com/")
+    print("and create an application first.")
+    print()
+
+    if not client_id:
+        client_id = input("  TESLA_CLIENT_ID: ").strip()
+    if not client_secret:
+        client_secret = input("  TESLA_CLIENT_SECRET: ").strip()
+    if not redirect_uri:
+        redirect_uri = input("  TESLA_REDIRECT_URI (e.g. https://your-domain.com/callback): ").strip()
+
+    if not all([client_id, client_secret, redirect_uri]):
+        print("\nERROR: All three credentials are required.")
+        sys.exit(1)
+
+    if not fleet_api_base:
+        print()
+        print("  Fleet API region:")
+        print("    [1] North America (default)")
+        print("    [2] Europe")
+        print("    [3] China")
+        choice = input("  Select [1]: ").strip() or "1"
+        region_map = {"1": "na", "2": "eu", "3": "cn"}
+        fleet_api_base = FLEET_REGIONS.get(region_map.get(choice, "na"), FLEET_REGIONS["na"])
+
+    print()
+    return client_id, client_secret, redirect_uri, fleet_api_base
+
+
+def _ssl_ctx():
+    """Build an SSLContext matching the platform-aware Tesla TLS policy.
+
+    Mirrors _httpx_auth_verify() in tesla_auth.py:
+      * Windows: TLS 1.2 only — Windows OpenSSL's TLS 1.3 fingerprint is
+        rejected by Tesla, causing tainted tokens / 403 errors.
+      * Other platforms: strict TLS 1.3 pin (unchanged from pre-PR behaviour).
+    """
+    ctx = ssl.create_default_context()
+    if sys.platform == 'win32' and hasattr(ssl.TLSVersion, 'TLSv1_2'):
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    elif hasattr(ssl.TLSVersion, 'TLSv1_3'):
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    return ctx
+
+
+def api_call(url, method="GET", data=None, headers=None, token=None):
+    """Make an API call to Tesla endpoints using HTTP/2 when available.
+
+    Tesla now requires HTTP/2 for owner-api.teslamotors.com calls (June 2026).
+    Falls back to urllib (HTTP/1.1) for non-Tesla URLs or if httpx is missing.
+    """
+    # Use httpx with HTTP/2 for Tesla API endpoints
+    is_tesla = 'teslamotors.com' in url or 'tesla.com' in url or 'tesla.cn' in url
+    if is_tesla:
+        try:
+            import httpx
+        except ImportError:
+            httpx = None
+        if httpx:
+            req_headers = {}
+            if token:
+                req_headers['Authorization'] = f"Bearer {token}"
+            if headers:
+                req_headers.update(headers)
+            client_kwargs = {'http2': True, 'verify': _ssl_ctx(), 'timeout': 30}
+            try:
+                with httpx.Client(**client_kwargs) as client:
+                    resp = client.request(method, url, json=data if isinstance(data, dict) else None,
+                                          headers=req_headers)
+                    try:
+                        return resp.status_code, resp.json()
+                    except json.JSONDecodeError:
+                        return resp.status_code, resp.text
+            except Exception:
+                pass  # fall through to urllib fallback
+
+    # Fallback: urllib (HTTP/1.1) for non-Tesla URLs or missing httpx
+    req = urllib.request.Request(url, method=method)
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    if headers:
+        for k, v in headers.items():
+            req.add_header(k, v)
+    if data is not None:
+        if isinstance(data, dict):
+            data = json.dumps(data).encode()
+            req.add_header("Content-Type", "application/json")
+        elif isinstance(data, str):
+            data = data.encode()
+        req.data = data
+
+    try:
+        resp = urllib.request.urlopen(req, context=_ssl_ctx(), timeout=30)
+        body = resp.read().decode()
+        try:
+            return resp.status, json.loads(body)
+        except json.JSONDecodeError:
+            return resp.status, body
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            return e.code, json.loads(body)
+        except json.JSONDecodeError:
+            return e.code, body
+
+
+def generate_rsa_key(authpath=""):
+    """Generate RSA-4096 key pair for TEDapi v1r signing."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+
+    key_dir = authpath if authpath else CERT_DIR
+    private_key_file = os.path.join(key_dir, "tedapi_rsa_private.pem")
+    public_key_file = os.path.join(key_dir, "tedapi_rsa_public.der")
+
+    if os.path.exists(private_key_file):
+        print(f"  RSA key already exists at {private_key_file}, reusing")
+        with open(private_key_file, "rb") as f:
+            private_key = serialization.load_pem_private_key(f.read(), password=None)
+        public_key_der = private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.PKCS1
+        )
+        print(f"  Public key fingerprint (SHA256): {hashlib.sha256(public_key_der).hexdigest()}")
+        return private_key, public_key_der
+
+    print("  Generating RSA-4096 key pair...")
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+
+    # Save private key (PEM)
+    pem = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption()
+    )
+    if authpath:
+        os.makedirs(authpath, exist_ok=True)
+    # Create with 0o600 at open time (owner-only) - chmod-after-write leaves
+    # a window where the private key is world-readable
+    with open(os.open(private_key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+        f.write(pem)
+    os.chmod(private_key_file, 0o600)
+
+    # Get public key (DER PKCS1)
+    public_key_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.PKCS1
+    )
+    with open(public_key_file, "wb") as f:
+        f.write(public_key_der)
+
+    print(f"  Private key saved: {private_key_file}")
+    print(f"  Public key saved:  {public_key_file}")
+    print(f"  Public key fingerprint (SHA256): {hashlib.sha256(public_key_der).hexdigest()}")
+    return private_key, public_key_der
+
+
+def step1_get_auth_code(client_id, redirect_uri):
+    """Generate auth URL and get authorization code from user."""
+    state = secrets.token_hex(32)
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": SCOPE,
+        "state": state,
+    }
+    auth_url = f"{AUTH_BASE}/oauth2/v3/authorize?{urllib.parse.urlencode(params)}"
+
+    print("=" * 70)
+    print("  STEP 1: Tesla OAuth Login")
+    print("=" * 70)
+    print()
+    print("  Open this URL in your browser:")
+    print()
+    print(f"  {auth_url}")
+    print()
+    print(f"  After authorizing, Tesla will redirect to {redirect_uri}")
+    print("  The page will show a 404 — that's expected.")
+    print("  Copy the FULL URL from your browser's address bar.")
+    print()
+
+    redirect_url = input("  Paste the redirect URL here: ").strip()
+
+    parsed = urllib.parse.urlparse(redirect_url)
+    params = urllib.parse.parse_qs(parsed.query)
+
+    if "code" not in params:
+        print(f"\n  ERROR: No 'code' parameter found in URL: {redirect_url}")
+        sys.exit(1)
+
+    code = params["code"][0]
+    print(f"  Got authorization code: {code[:20]}...")
+    return code
+
+
+def step2_exchange_token(code, client_id, client_secret, redirect_uri, fleet_api_base, tokens_file=None):
+    """Exchange authorization code for access + refresh tokens."""
+    if tokens_file is None:
+        tokens_file = os.path.join(CERT_DIR, "fleet_tokens.json")
+    print()
+    print("=" * 70)
+    print("  STEP 2: Exchanging code for tokens...")
+    print("=" * 70)
+
+    data = urllib.parse.urlencode({
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "audience": fleet_api_base,
+        "redirect_uri": redirect_uri,
+        "scope": SCOPE,
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{TOKEN_BASE}/oauth2/v3/token",
+        data=data,
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    try:
+        resp = urllib.request.urlopen(req, context=_ssl_ctx(), timeout=30)
+        tokens = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        print(f"\n  Token exchange failed ({e.code}): {body}")
+        sys.exit(1)
+
+    # Save tokens
+    tokens["obtained_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    # Create with 0o600 at open time - avoid chmod-after-write race
+    with open(os.open(tokens_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(tokens, f, indent=2)
+    os.chmod(tokens_file, 0o600)
+
+    print(f"  Access token:  {tokens['access_token'][:30]}...")
+    print(f"  Refresh token: {tokens.get('refresh_token', 'N/A')[:30]}...")
+    print(f"  Expires in:    {tokens.get('expires_in', '?')}s")
+    print(f"  Saved to:      {tokens_file}")
+    return tokens["access_token"]
+
+
+class _TokenExpiredError(Exception):
+    """Raised when the API returns 401 (token expired)."""
+
+
+def step3_get_site_id(token, fleet_api_base):
+    """Get energy_site_id from Tesla API."""
+    print()
+    print("=" * 70)
+    print("  STEP 3: Finding your Powerwall site...")
+    print("=" * 70)
+
+    code, resp = api_call(f"{fleet_api_base}/api/1/products", token=token)
+    if code == 401:
+        raise _TokenExpiredError(resp)
+    if code != 200:
+        print(f"\n  Failed to get products ({code}): {resp}")
+        sys.exit(1)
+
+    sites = []
+    for product in resp.get("response", []):
+        if "energy_site_id" in product:
+            sites.append({
+                "energy_site_id": product["energy_site_id"],
+                "gateway_din": product.get("gateway_id", "unknown"),
+                "site_name": product.get("site_name", "unknown"),
+            })
+
+    if not sites:
+        print("\n  No energy sites found on this account!")
+        sys.exit(1)
+
+    print(f"\n  Found {len(sites)} energy site(s):")
+    for i, site in enumerate(sites):
+        print(f"    [{i}] {site['site_name']} (ID: {site['energy_site_id']}, DIN: {site['gateway_din']})")
+
+    if len(sites) == 1:
+        selected = sites[0]
+    else:
+        print()
+        idx = int(input("  Select site number: "))
+        selected = sites[idx]
+
+    print(f"\n  Using: {selected['site_name']} ({selected['energy_site_id']})")
+    return selected["energy_site_id"], selected["gateway_din"]
+
+
+# Authorized-client key states reported by the gateway. The values match
+# tesla_fleet_api.const.AuthorizedClientState. State 2 is a timeout, not a
+# stage of verification: the key's window (about 10 minutes from registration)
+# has closed and the key can never reach 3. Re-registering the same public
+# key reopens the window. See https://github.com/jasonacox/pypowerwall/issues/354
+KEY_STATES = {
+    1: "PENDING_VERIFICATION",
+    2: "PENDING_VERIFICATION_TIMEOUT",
+    3: "VERIFIED",
+    4: "REMOVED",
+}
+
+# How to give the physical proof once a key is registered (state 1).
+PHYSICAL_PROOF_HINT = (
+    "  Within about 10 minutes of registering, switch the Powerwall 3 On/Off\n"
+    "  switch (left side of the unit, under the red rapid-shutdown flap) OFF\n"
+    "  for about 15 seconds, then back ON. Do not leave it off until the unit\n"
+    "  powers down: the gateway then drops off the network for minutes and the\n"
+    "  window closes before it can report. A 2 second flick is debounced and\n"
+    "  does nothing. On some units toggling one AC breaker also works."
+)
+
+
+# How long to watch for VERIFIED after the physical proof. The documented
+# transition took 62 s from the registration call (#354); a deadline (not an
+# attempt count) with margin keeps a working procedure from being reported as a
+# failure. Polls every 10 s to limit Fleet API command calls.
+POST_PROOF_POLL_SECONDS = 120
+POST_PROOF_POLL_DELAY = 10
+
+
+def key_state_name(state):
+    """Human-readable name for a gateway key state integer."""
+    return KEY_STATES.get(state, "UNKNOWN")
+
+
+def _check_key_state(resp, pubkey_der=None):
+    """Extract client state from Fleet API registration/list response.
+
+    Returns the state integer if found, None otherwise.
+    State values: 1=PENDING_VERIFICATION, 2=PENDING_VERIFICATION_TIMEOUT,
+    3=VERIFIED, 4=REMOVED (see KEY_STATES).
+
+    If pubkey_der is provided and the response is a ListAuthorizedClientsResponse,
+    only returns the state for the client whose public key matches pubkey_der.
+    This prevents false VERIFIED results when another key (e.g. Tesla app key)
+    is already verified.
+    """
+    try:
+        msg = resp["response"]["message"]["Payload"]["Authorization"]["Message"]
+    except (KeyError, TypeError):
+        try:
+            msg = resp["response"]["message"]["payload"]["authorization"]["message"]
+        except (KeyError, TypeError):
+            return None
+
+    # Check AddAuthorizedClientResponse (registration response)
+    for key in ("AddAuthorizedClientResponse", "add_authorized_client_response"):
+        if key in msg:
+            client = msg[key].get("client") or msg[key].get("Client")
+            if client:
+                state = client.get("state") or client.get("State")
+                if state is not None:
+                    return int(state)
+
+    # Check ListAuthorizedClientsResponse (list response)
+    for key in ("ListAuthorizedClientsResponse", "list_authorized_clients_response"):
+        if key in msg:
+            clients = msg[key].get("clients") or msg[key].get("Clients") or []
+            for client in clients:
+                # If pubkey_der is provided, match the specific key
+                if pubkey_der is not None:
+                    client_pubkey = client.get("public_key") or client.get("PublicKey") or ""
+                    if client_pubkey:
+                        try:
+                            decoded = base64.b64decode(client_pubkey)
+                            if decoded != pubkey_der:
+                                continue
+                        except Exception:
+                            # Fallback: compare raw string representation
+                            if client_pubkey != base64.b64encode(pubkey_der).decode():
+                                continue
+                    else:
+                        continue  # no public_key to match
+                state = client.get("state") or client.get("State")
+                if state is not None:
+                    return int(state)
+
+    return None
+
+
+def _poll_key_state(token, energy_site_id, fleet_api_base, attempts=3, delay=5, pubkey_der=None,
+                    timeout=None):
+    """Poll list_authorized_clients_request to check key verification state.
+
+    Returns the state integer of the most recently registered key, or None.
+    If pubkey_der is provided, checks the specific key instead of any key.
+    Stops early on a terminal state (3 VERIFIED, 2 TIMEOUT). With ``timeout``
+    (seconds) it polls every ``delay`` seconds until that deadline instead of
+    making ``attempts`` polls.
+    """
+    verify_payload = {
+        "command_properties": {
+            "message": {
+                "authorization": {
+                    "list_authorized_clients_request": {}
+                }
+            },
+            "identifier_type": 1,
+        },
+        "command_type": "grpc_command",
+    }
+
+    state = None
+    start = time.monotonic()
+    attempt = 0
+    while True:
+        if attempt > 0:
+            if timeout is None and attempt >= attempts:
+                break
+            if timeout is not None and time.monotonic() - start + delay > timeout:
+                break
+            time.sleep(delay)
+        attempt += 1
+        code, resp = api_call(
+            f"{fleet_api_base}/api/1/energy_sites/{energy_site_id}/command",
+            method="POST",
+            data=verify_payload,
+            token=token,
+        )
+        if timeout is None:
+            print(f"  Poll attempt {attempt}/{attempts}: ({code})")
+        else:
+            print(f"  Poll at +{time.monotonic() - start:.0f}s of {timeout}s: ({code})")
+        state = _check_key_state(resp, pubkey_der=pubkey_der)
+        if state is not None:
+            print(f"  Key state: {state} ({key_state_name(state)})")
+            if state == 3:
+                return state
+            if state == 2:
+                # The window closed. Further polling cannot change this state.
+                print("  The verification window has closed. Re-register the same key to reopen it.")
+                return state
+        else:
+            # Show raw response for debugging if state couldn't be parsed
+            if isinstance(resp, dict):
+                print(f"  {json.dumps(resp, indent=2)[:2000]}")
+
+    return state
+
+
+def step4_register_key(token, energy_site_id, public_key_der, fleet_api_base, private_key_file=None):
+    """Register RSA public key with the Powerwall via Fleet API."""
+    print()
+    print("=" * 70)
+    print("  STEP 4: Registering RSA public key with Powerwall...")
+    print("=" * 70)
+
+    b64_pubkey = base64.b64encode(public_key_der).decode()
+
+    payload = {
+        "command_properties": {
+            "message": {
+                "authorization": {
+                    "add_authorized_client_request": {
+                        "key_type": 1,
+                        "public_key": b64_pubkey,
+                        "authorized_client_type": 1,
+                        "description": "Powerwall LAN Client",
+                    }
+                }
+            },
+            "identifier_type": 1,
+        },
+        "command_type": "grpc_command",
+    }
+
+    code, resp = api_call(
+        f"{fleet_api_base}/api/1/energy_sites/{energy_site_id}/command",
+        method="POST",
+        data=payload,
+        token=token,
+    )
+
+    if code != 200:
+        print(f"\n  Registration failed ({code}): {json.dumps(resp, indent=2)}")
+        sys.exit(1)
+
+    # Check if cloud registration auto-verified the key
+    state = _check_key_state(resp, pubkey_der=public_key_der)
+    if state == 3:
+        print("\n  Key verified automatically via cloud — no breaker toggle needed!")
+    else:
+        if state is not None:
+            print(f"\n  Registration response state: {state} (not yet verified)")
+        else:
+            print(f"\n  Response ({code}): {json.dumps(resp, indent=2)}")
+        # Poll to see if state transitions to VERIFIED
+        print("\n  Checking key verification status...")
+        state = _poll_key_state(token, energy_site_id, fleet_api_base, pubkey_der=public_key_der)
+        if state == 3:
+            print("\n  Key verified via cloud!")
+        elif state == 2:
+            # Terminal: the physical proof cannot verify a timed-out key, so skip
+            # STEP 5 and go straight to the re-register guidance below
+            pass
+        else:
+            # Fallback: physical confirmation
+            print()
+            print("=" * 70)
+            print("  STEP 5: Physical confirmation required")
+            print("=" * 70)
+            print()
+            print("  Cloud auto-verification did not complete.")
+            print(PHYSICAL_PROOF_HINT)
+            print("  This confirms the key registration on the device.")
+            print()
+            input("  Press Enter after switching the Powerwall OFF and back ON...")
+            print("\n  Verifying key registration...")
+            state = _poll_key_state(token, energy_site_id, fleet_api_base,
+                                    pubkey_der=public_key_der, delay=POST_PROOF_POLL_DELAY,
+                                    timeout=POST_PROOF_POLL_SECONDS)
+
+    # Done
+    verified = state == 3
+    print()
+    print("=" * 70)
+    print(f"  {'Registration complete!' if verified else 'Registration sent.'}")
+    print("=" * 70)
+    print()
+    if verified:
+        print("  Key is VERIFIED and ready for use.")
+    else:
+        print("  Key state could not be confirmed as verified.")
+        if state == 2:
+            from pypowerwall.tedapi.tedapi_v1r import reregister_hint
+            print("  State 2 means the verification window closed (PENDING_VERIFICATION_TIMEOUT).")
+            print("  Re-register the same key, then give the physical proof within about")
+            print("  10 minutes:")
+            print(f"    {reregister_hint(private_key_file)}")
+        else:
+            print("  It may still be pending — check again later with list_authorized_clients.")
+    if private_key_file:
+        print(f"\n  RSA private key: {private_key_file}")
+    print(f"  Public key fingerprint (SHA256): {hashlib.sha256(public_key_der).hexdigest()}")
+    print("  (pypowerwall logs this same fingerprint at connect time — compare them")
+    print("   if data calls return None; a mismatch means the wrong key file is in use.)")
+    print()
+    print("  Next steps (library usage):")
+    print("    import pypowerwall")
+    print('    pw = pypowerwall.Powerwall(host="POWERWALL_IP", gw_pwd="FULL_QR_STICKER_PASSWORD",')
+    print('         rsa_key_path="tedapi_rsa_private.pem")')
+    print()
+    print("  Next steps (Docker / Powerwall-Dashboard):")
+    print("    1. Copy the key to your Powerwall-Dashboard .auth/ directory")
+    print("    2. Set PW_RSA_KEY_PATH=/app/.auth/tedapi_rsa_private.pem")
+    print("    3. Set PW_HOST to your Powerwall's wired LAN IP")
+    print("    4. Set PW_GW_PWD to the full QR sticker password")
+    print("       (or PW_PASSWORD to the last 5 characters of it)")
+    print("    5. Start the container — v1r mode is auto-detected")
+    print()
+
+
+def owner_api_login(email=None, authpath="", force_reauth=False):
+    """
+    Authenticate with the Tesla Owner API using tesla_auth.
+
+    Uses the same native WebView PKCE flow as cloud mode setup
+    ('python -m pypowerwall setup'). The tesla:// callback is intercepted
+    by the WebView — no browser redirect issues.
+
+    Args:
+        email:        Tesla account email (prompted if not provided).
+        authpath:     Directory containing the auth cache file.
+        force_reauth: If True, delete the cached token and require a fresh login.
+
+    Returns the Bearer access token string on success.
+    """
+    from pypowerwall.tesla_auth import login as tesla_login, save_token, _refresh_access_token
+
+    authfile = os.path.join(authpath, OWNER_AUTHFILE) if authpath else OWNER_AUTHFILE
+
+    print("=" * 70)
+    print("  Tesla Owner API — Login")
+    print("=" * 70)
+    print()
+
+    if force_reauth:
+        if os.path.exists(authfile):
+            os.remove(authfile)
+            print(f"  Removed expired token cache ({authfile})")
+        print("  Please log in again to obtain a fresh token.")
+        print()
+    else:
+        print("  This is the same login used by Cloud Mode (python -m pypowerwall setup).")
+        print("  No developer app setup required.")
+        print()
+
+    # Check for existing cached credentials
+    if os.path.exists(authfile) and not force_reauth:
+        try:
+            with open(authfile) as f:
+                cache = json.load(f)
+            # Select cached account matching the requested email, or
+            # fall back to the first cached account when no email specified
+            if email and email in cache:
+                cached_email = email
+            elif cache:
+                cached_email = list(cache.keys())[0]
+            else:
+                cached_email = None
+            if cached_email:
+                sso = cache[cached_email].get("sso", {})
+                access_token = sso.get("access_token")
+                refresh_token = sso.get("refresh_token")
+                expires_at = sso.get("expires_at", 0)
+
+                # Try to use cached access token if not expired
+                import time as _time
+                if access_token and expires_at > _time.time() + 300:
+                    print(f"  Using cached credentials from {authfile}")
+                    return access_token
+
+                # Try refresh token
+                if refresh_token:
+                    print(f"  Cached token expired, refreshing...")
+                    try:
+                        new_data = _refresh_access_token(refresh_token)
+                        access_token = new_data.get("access_token", access_token)
+                        # Update cache
+                        sso.update(new_data)
+                        sso["expires_at"] = int(_time.time() + new_data.get("expires_in", 28800))
+                        cache[cached_email]["sso"] = sso
+                        # Create with 0o600 at open time - avoid chmod-after-write race
+                        with open(os.open(authfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                            json.dump(cache, f, indent=2)
+                        os.chmod(authfile, 0o600)
+                        print(f"  Token refreshed successfully.")
+                        return access_token
+                    except Exception as e:
+                        print(f"  Token refresh failed ({e}), requesting new login...")
+        except Exception as e:
+            print(f"  Could not read cached credentials: {e}")
+
+    # Native WebView login — same as cloud mode setup
+    refresh_token, detected_email, token_data = tesla_login(
+        email=email,
+        headless=False,
+        debug=False,
+    )
+
+    actual_email = detected_email or email
+    if not actual_email:
+        actual_email = input("  Tesla account email: ").strip()
+
+    # Save to auth file in teslapy-compatible format
+    if not token_data:
+        token_data = {"refresh_token": refresh_token, "token_type": "Bearer", "expires_in": 28800}
+
+    save_token(token_data, path=authfile, email=actual_email)
+
+    # Read back the access token from the saved file
+    try:
+        with open(authfile) as f:
+            cache = json.load(f)
+        access_token = cache[actual_email]["sso"]["access_token"]
+    except Exception:
+        # Fallback: refresh the token we just got to get an access token
+        new_data = _refresh_access_token(refresh_token)
+        access_token = new_data.get("access_token")
+
+    if not access_token:
+        print("  ERROR: Could not retrieve access token.")
+        sys.exit(1)
+
+    print(f"\n  Login successful, credentials cached to {authfile}")
+    return access_token
+
+
+def main(authpath=""):
+    print("=" * 70)
+    print("  Tesla RSA Key Registration for Powerwall v1r LAN Mode")
+    print("=" * 70)
+    print()
+    print("  Choose how to authenticate with Tesla:")
+    print()
+    print("    [1] Owner API  (recommended — just your Tesla email and password,")
+    print("                   same login as 'python -m pypowerwall setup')")
+    print("    [2] Fleet API  (requires a developer app at developer.tesla.com)")
+    print()
+    choice = input("  Select [1]: ").strip() or "1"
+
+    print()
+    print("=" * 70)
+    print("  Generating RSA key pair...")
+    print("=" * 70)
+    print()
+    private_key, public_key_der = generate_rsa_key(authpath=authpath)
+    key_dir = authpath if authpath else CERT_DIR
+    private_key_file = os.path.join(key_dir, "tedapi_rsa_private.pem")
+    tokens_file = os.path.join(key_dir, "fleet_tokens.json")
+
+    if choice == "2":
+        # ── Fleet API path ────────────────────────────────────────────────────
+        client_id, client_secret, redirect_uri, fleet_api_base = get_config()
+
+        # Check for existing Fleet API tokens
+        if os.path.exists(tokens_file):
+            with open(tokens_file) as f:
+                tokens = json.load(f)
+            token = tokens.get("access_token")
+            print(f"\n  Found existing Fleet API tokens from {tokens.get('obtained_at', '?')}")
+            use = input("  Use existing token? [Y/n]: ").strip().lower()
+            if use != "n":
+                site_id, din = step3_get_site_id(token, fleet_api_base)
+                step4_register_key(token, site_id, public_key_der, fleet_api_base, private_key_file=private_key_file)
+                return
+
+        code = step1_get_auth_code(client_id, redirect_uri)
+        token = step2_exchange_token(code, client_id, client_secret, redirect_uri, fleet_api_base, tokens_file=tokens_file)
+        site_id, din = step3_get_site_id(token, fleet_api_base)
+        step4_register_key(token, site_id, public_key_der, fleet_api_base, private_key_file=private_key_file)
+    else:
+        # ── Owner API path (default) ──────────────────────────────────────────
+        email = None
+        for attempt in range(2):
+            token = owner_api_login(email=email, authpath=authpath, force_reauth=(attempt > 0))
+            try:
+                site_id, din = step3_get_site_id(token, OWNER_API_BASE)
+                break
+            except _TokenExpiredError as e:
+                if attempt == 0:
+                    print(f"\n  Token expired ({e}).")
+                    print("  Clearing cached credentials and requesting a new login...")
+                    # Preserve the email so the re-auth prompt is skipped
+                    email = input("  Confirm your Tesla account email (or press Enter to re-enter): ").strip() or None
+                else:
+                    print("\n  ERROR: Authentication failed after token refresh. Please try again.")
+                    sys.exit(1)
+        step4_register_key(token, site_id, public_key_der, OWNER_API_BASE, private_key_file=private_key_file)
+
+
+if __name__ == "__main__":
+    main()

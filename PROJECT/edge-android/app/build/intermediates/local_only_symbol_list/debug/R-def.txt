@@ -1,0 +1,15 @@
+R_DEF: Internal format may change without notice
+local
+color background_dark
+color battery_color
+color grid_color
+color home_color
+color primary
+color primary_dark
+color solar_color
+color surface_dark
+drawable ic_notification
+string app_name
+string channel_description
+string channel_name
+string service_name

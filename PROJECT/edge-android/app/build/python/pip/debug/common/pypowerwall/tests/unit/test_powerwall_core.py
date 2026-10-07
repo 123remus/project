@@ -1,0 +1,417 @@
+import json
+import pytest
+from unittest.mock import patch
+from pypowerwall import Powerwall
+from pypowerwall.pypowerwall_base import PyPowerwallBase
+from pypowerwall.exceptions import PyPowerwallInvalidConfigurationParameter
+
+class StubClient(PyPowerwallBase):
+    def __init__(self):
+        super().__init__(email='test@example.com')
+        self.calls = []
+        # minimal caches
+        self._poll_map = {
+            '/api/meters/aggregates': {
+                'site': {'instant_power': 1000},
+                'solar': {'instant_power': 2000},
+                'battery': {'instant_power': -500},
+                'load': {'instant_power': 1500}
+            },
+            '/api/status': {'version': '23.44.1', 'din': 'DIN123', 'up_time_seconds': 1234},
+            '/api/system_status/grid_status': {'grid_status': 'SystemGridConnected'},
+            '/api/system_status': {'battery_blocks': [], 'grid_faults': [], 'system_island_state': 'SystemGridConnected'},
+            '/api/operation': {'backup_reserve_percent': 20, 'real_mode': 'self_consumption'},
+            '/api/site_info/site_name': {'site_name': 'Test Site'},
+            '/api/solar_powerwall': {
+                'pvac_status': {'string_vitals': []},
+                'pvac_alerts': {'OverVoltage': True, 'UnderTemp': False},
+                'pvs_alerts': {'StringFault': True}
+            }
+        }
+        self._vitals = {
+            'TETHC--X--SN123': {
+                'THC_AmbientTemp': 25.5,
+                'THC_State': 'Normal'
+            }
+        }
+
+    def authenticate(self):
+        return True
+
+    def close_session(self):
+        return True
+
+    def poll(self, api: str, force: bool = False, recursive: bool = False, raw: bool = False):
+        self.calls.append(('poll', api, force))
+        return self._poll_map.get(api)
+
+    def post(self, api: str, payload, din: str, recursive: bool = False, raw: bool = False):
+        self.calls.append(('post', api, payload))
+        # Simulate modifying backup_reserve_percent (partial payloads honored)
+        if api == '/api/operation' and payload:
+            if 'backup_reserve_percent' in payload:
+                self._poll_map['/api/operation']['backup_reserve_percent'] = payload['backup_reserve_percent']
+            if payload.get('real_mode'):
+                self._poll_map['/api/operation']['real_mode'] = payload['real_mode']
+        return {'ok': True, 'payload': payload}
+
+    def vitals(self):
+        return self._vitals
+
+    def get_time_remaining(self):
+        return 4.5
+
+
+class StubClientWithIslanding(StubClient):
+    def __init__(self):
+        super().__init__()
+        self.go_off_grid_calls = 0
+        self.reconnect_grid_calls = 0
+
+    def go_off_grid(self):
+        self.go_off_grid_calls += 1
+        return {'result': 'ok'}
+
+    def reconnect_grid(self):
+        self.reconnect_grid_calls += 1
+        return {'result': 'ok'}
+
+@pytest.fixture(name="pw")
+def fixture_powerwall():
+    # Instantiate Powerwall but replace its client with our stub.
+    # Patch the cloud backend by name - a cached .pypowerwall.auth in CWD would
+    # otherwise let connect() reach the real Tesla auth endpoint.
+    with patch('pypowerwall.PyPowerwallCloud'):
+        inst = Powerwall(host='', password='', email='test@example.com', cloudmode=True, siteid=None)
+    inst.client = StubClient()
+    return inst
+
+def test_poll_jsonformat(pw):
+    out = pw.poll('/api/site_info/site_name', jsonformat=True)
+    assert isinstance(out, str)
+    data = json.loads(out)
+    assert data['site_name'] == 'Test Site'
+
+def test_level_and_power(pw):
+    lvl = pw.level()
+    assert lvl is None  # because /api/system_status/soe not in map
+    p = pw.power()
+    assert p['site'] == 1000 and p['solar'] == 2000 and p['battery'] == -500 and p['load'] == 1500
+
+
+def test_grid_status(pw):
+    assert pw.grid_status() == 'UP'
+    assert pw.grid_status(type='numeric') == 1
+    j = pw.grid_status(type='json')
+    assert 'grid_status' in json.loads(j)
+
+
+def test_alerts_with_vitals_and_fallback(pw):
+    # With vitals present, alerts set should be empty until fallback
+    # Simulate vitals absent to trigger fallback logic
+    pw.client._vitals = {}
+    alerts = pw.alerts()
+    # Expect inferred alerts from solar_powerwall and grid status mapping
+    assert 'OverVoltage' in alerts
+    assert 'StringFault' in alerts
+    assert 'SystemConnectedToGrid' in alerts
+
+
+def test_set_operation_validation(pw):
+    # Invalid level
+    assert pw.set_operation(level=150) is None
+    # Valid update
+    resp = pw.set_operation(level=30, mode='backup')
+    assert resp['ok'] is True
+
+
+def test_get_reserve_and_mode(pw):
+    r = pw.get_reserve(scale=False)
+    assert r == 20
+    m = pw.get_mode()
+    assert m == 'self_consumption'
+
+
+def test_set_mode_and_reserve_helpers(pw):
+    # set_reserve wraps set_operation
+    resp = pw.set_reserve(40)
+    assert resp['ok'] is True
+    assert pw.get_reserve(scale=False) == 40
+    resp2 = pw.set_mode('backup')
+    assert resp2['ok'] is True
+
+
+def test_battery_blocks_temp_merge(pw):
+    # system_status has empty battery_blocks so battery_blocks() should handle gracefully
+    blocks = pw.battery_blocks()
+    assert blocks is None or isinstance(blocks, (dict, list))
+
+
+def test_temps(pw):
+    t = pw.temps()
+    assert isinstance(t, dict)
+
+
+def test_site_name(pw):
+    assert pw.site_name() == 'Test Site'
+
+
+def test_go_off_grid_requires_confirm(pw):
+    pw.client = StubClientWithIslanding()
+    out = pw.go_off_grid()
+    assert out is None
+    assert pw.client.go_off_grid_calls == 0
+
+
+def test_go_off_grid_with_confirm_delegates(pw):
+    pw.client = StubClientWithIslanding()
+    out = pw.go_off_grid(confirm=True)
+    assert out == {'result': 'ok'}
+    assert pw.client.go_off_grid_calls == 1
+
+
+def test_reconnect_grid_delegates(pw):
+    pw.client = StubClientWithIslanding()
+    out = pw.reconnect_grid()
+    assert out == {'result': 'ok'}
+    assert pw.client.reconnect_grid_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Host validation tests (_validate_init_configuration host:port support)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(name="pw_validator")
+def fixture_pw_validator():
+    """Powerwall created in cloud mode (no local connection) used as a harness
+    to invoke _validate_init_configuration() with arbitrary host values."""
+    # Patch by name so a cached .pypowerwall.auth in CWD can't reach the network
+    with patch('pypowerwall.PyPowerwallCloud'):
+        inst = Powerwall(host='', password='', email='test@example.com', cloudmode=True)
+    # Switch to local-like state so only the host block runs during re-validation
+    inst.cloudmode = False
+    inst.fleetapi = False
+    return inst
+
+
+def _set_and_validate(pw, host):
+    pw.host = host
+    pw._validate_init_configuration()
+
+
+class TestHostPortValidation:
+    """Unit tests for host / host:port validation logic."""
+
+    def test_bare_ipv4_valid(self, pw_validator):
+        _set_and_validate(pw_validator, "192.168.1.50")
+
+    def test_bare_hostname_valid(self, pw_validator):
+        _set_and_validate(pw_validator, "powerwall.local")
+
+    def test_bare_fqdn_valid(self, pw_validator):
+        _set_and_validate(pw_validator, "gateway.example.com")
+
+    def test_host_port_valid(self, pw_validator):
+        _set_and_validate(pw_validator, "192.168.1.50:8443")
+
+    def test_host_port_default_443(self, pw_validator):
+        _set_and_validate(pw_validator, "192.168.91.1:443")
+
+    def test_hostname_port_valid(self, pw_validator):
+        _set_and_validate(pw_validator, "powerwall.local:8443")
+
+    def test_port_zero_rejected(self, pw_validator):
+        with pytest.raises(PyPowerwallInvalidConfigurationParameter):
+            _set_and_validate(pw_validator, "192.168.1.50:0")
+
+    def test_port_too_large_rejected(self, pw_validator):
+        with pytest.raises(PyPowerwallInvalidConfigurationParameter):
+            _set_and_validate(pw_validator, "192.168.1.50:65536")
+
+    def test_invalid_host_rejected(self, pw_validator):
+        with pytest.raises(PyPowerwallInvalidConfigurationParameter):
+            _set_and_validate(pw_validator, "not a host!!")
+
+    def test_bare_ipv6_valid(self, pw_validator):
+        # Valid bare IPv6 passes regex validation (URL construction is a separate concern)
+        _set_and_validate(pw_validator, "2001:db8::1")
+
+    def test_invalid_ipv6_like_rejected(self, pw_validator):
+        # Multi-colon string that is not valid IPv6 must not slip through
+        # via port-stripping and must raise a validation error
+        with pytest.raises(PyPowerwallInvalidConfigurationParameter):
+            _set_and_validate(pw_validator, "2001:db8::99999")
+
+    def test_empty_host_skips_validation(self, pw_validator):
+        # Empty host bypasses the block entirely (cloud/fleet mode use case)
+        _set_and_validate(pw_validator, "")
+
+
+class TestTEDAPIv1rReserveScaling:
+    """Verify that TEDAPI v1r post_api_operation() converts app-scale → raw before writing config."""
+
+    def test_post_api_operation_scales_app_to_raw(self):
+        """set_reserve(25) should write raw=28.75 (=25*0.95+5) to TEDAPI config."""
+        from unittest.mock import MagicMock, patch
+        from pypowerwall.tedapi.pypowerwall_tedapi import PyPowerwallTEDAPI
+
+        mock_tedapi = MagicMock()
+        mock_tedapi.v1r = True
+        mock_tedapi._write_config.return_value = True
+
+        with patch.object(PyPowerwallTEDAPI, '__init__', return_value=None):
+            pw_tedapi = PyPowerwallTEDAPI.__new__(PyPowerwallTEDAPI)
+            pw_tedapi.tedapi = mock_tedapi
+
+        payload = {'backup_reserve_percent': 25, 'real_mode': 'self_consumption'}
+        pw_tedapi.post_api_operation(payload=payload)
+
+        written = mock_tedapi._write_config.call_args[0][0]
+        raw = written['site_info.backup_reserve_percent']
+        # 25 * 0.95 + 5 = 28.75
+        assert abs(raw - 28.75) < 0.001, f"Expected raw 28.75, got {raw}"
+
+    def test_post_api_operation_zero_level_becomes_five_raw(self):
+        """set_reserve(0) should write raw=5 (=0*0.95+5) — the physical minimum."""
+        from unittest.mock import MagicMock, patch
+        from pypowerwall.tedapi.pypowerwall_tedapi import PyPowerwallTEDAPI
+
+        mock_tedapi = MagicMock()
+        mock_tedapi.v1r = True
+        mock_tedapi._write_config.return_value = True
+
+        with patch.object(PyPowerwallTEDAPI, '__init__', return_value=None):
+            pw_tedapi = PyPowerwallTEDAPI.__new__(PyPowerwallTEDAPI)
+            pw_tedapi.tedapi = mock_tedapi
+
+        payload = {'backup_reserve_percent': 0, 'real_mode': 'self_consumption'}
+        pw_tedapi.post_api_operation(payload=payload)
+
+        written = mock_tedapi._write_config.call_args[0][0]
+        raw = written['site_info.backup_reserve_percent']
+        # 0 * 0.95 + 5 = 5.0
+        assert abs(raw - 5.0) < 0.001, f"Expected raw 5.0, got {raw}"
+
+
+# ---------------------------------------------------------------------------
+# set_operation() payload construction tests
+# ---------------------------------------------------------------------------
+
+class TestSetOperationPayload:
+    """Partial-payload semantics per backend (PW3 mode-persistence race fix).
+
+    Tesla applies BACKUP_RESERVE and OPERATION_MODE as two async commands, so a
+    back-filled reserve write raced a mode-only change and the mode command could
+    be silently dropped. Non-local backends now write only the requested fields.
+    """
+
+    def test_mode_only_non_local_omits_reserve(self, pw):
+        # Non-local backends accept partial payloads: a mode-only write must not
+        # back-fill (and therefore not race) the reserve.
+        resp = pw.set_operation(mode='backup')
+        assert resp['ok'] is True
+        payload = pw.client.calls[-1][2]
+        assert payload == {'real_mode': 'backup'}
+        assert 'backup_reserve_percent' not in payload
+
+    def test_reserve_only_non_local_omits_mode(self, pw):
+        resp = pw.set_reserve(40)
+        assert resp['ok'] is True
+        payload = pw.client.calls[-1][2]
+        assert payload == {'backup_reserve_percent': 40}
+        assert 'real_mode' not in payload
+
+    def test_explicit_zero_level_stays_numeric(self, pw):
+        # Regression (nesys, pypowerwall-server PR #85): an explicit reserve of 0
+        # was coerced to boolean False, which the cloud path split into two
+        # racing Owner API commands and could drop the mode change.
+        resp = pw.set_operation(level=0, mode='autonomous')
+        assert resp['ok'] is True
+        payload = pw.client.calls[-1][2]
+        assert payload['backup_reserve_percent'] == 0
+        assert payload['backup_reserve_percent'] is not False
+        assert payload['real_mode'] == 'autonomous'
+
+    def test_explicit_zero_reserve_only(self, pw):
+        resp = pw.set_reserve(0)
+        assert resp['ok'] is True
+        payload = pw.client.calls[-1][2]
+        assert payload == {'backup_reserve_percent': 0}
+
+    def test_empty_payload_non_local_returns_none(self, pw):
+        # Regression (Copilot review): with neither level nor mode set on a
+        # partial-payload backend, set_operation() must not post an empty
+        # body (backends reject it by raising). Fail soft like the other
+        # invalid-input paths.
+        calls_before = len(pw.client.calls)
+        assert pw.set_operation() is None
+        assert len(pw.client.calls) == calls_before
+        assert pw.set_operation(mode='') is None
+        assert len(pw.client.calls) == calls_before
+
+    def test_backfill_uses_raw_scale_for_local(self, pw):
+        from unittest.mock import patch
+        # Local backend passes the payload verbatim to the gateway's raw-scale API
+        # and is a full overwrite, so mode-only writes still back-fill both fields.
+        with patch('pypowerwall.PyPowerwallLocal', StubClient):
+            resp = pw.set_operation(mode='backup')
+        assert resp['ok'] is True
+        payload = pw.client.calls[-1][2]
+        assert payload['backup_reserve_percent'] == 20
+        assert payload['real_mode'] == 'backup'
+
+    def test_backfill_local_explicit_zero_writes_zero(self, pw):
+        # On the local path, 0 used to become False (= "leave unchanged" marker)
+        # which silently no-opped set_reserve(0). It now writes a real 0.
+        from unittest.mock import patch
+        with patch('pypowerwall.PyPowerwallLocal', StubClient):
+            resp = pw.set_operation(level=0, mode='backup')
+        assert resp['ok'] is True
+        payload = pw.client.calls[-1][2]
+        assert payload['backup_reserve_percent'] == 0
+
+    def test_backfill_none_returns_none_local(self, pw):
+        # Gateway unreachable: get_reserve() returns None - must not raise TypeError
+        from unittest.mock import patch
+        with patch('pypowerwall.PyPowerwallLocal', StubClient):
+            del pw.client._poll_map['/api/operation']
+            resp = pw.set_operation(mode='backup')
+        assert resp is None
+
+
+# ---------------------------------------------------------------------------
+# alerts() regression tests (alertsonly=False used to raise TypeError)
+# ---------------------------------------------------------------------------
+
+class TestAlertsDeviceEntries:
+
+    def test_alertsonly_true_returns_strings(self, pw):
+        pw.client._vitals = {
+            'TETHC--X--SN123': {'alerts': ['ThermalFault', 'ThermalFault']},
+            'TEPINV--Y--SN456': {'alerts': ['GridCodesWrite']},
+        }
+        alerts = pw.alerts()
+        assert isinstance(alerts, list)
+        assert all(isinstance(a, str) for a in alerts)
+        assert 'ThermalFault' in alerts
+        assert 'GridCodesWrite' in alerts
+        assert 'SystemConnectedToGrid' in alerts  # normalized from grid_status
+        assert alerts.count('ThermalFault') == 1  # deduplicated
+
+    def test_alertsonly_false_returns_device_entries(self, pw):
+        pw.client._vitals = {
+            'TETHC--X--SN123': {'alerts': ['ThermalFault']},
+            'TEPINV--Y--SN456': {'alerts': ['GridCodesWrite']},
+        }
+        alerts = pw.alerts(alertsonly=False)  # used to raise TypeError: unhashable dict
+        assert isinstance(alerts, list)
+        assert {'TETHC--X--SN123': 'ThermalFault'} in alerts
+        assert {'TEPINV--Y--SN456': 'GridCodesWrite'} in alerts
+        assert 'SystemConnectedToGrid' in alerts  # inferred grid alert stays a string
+
+    def test_alertsonly_false_jsonformat(self, pw):
+        pw.client._vitals = {'TETHC--X--SN123': {'alerts': ['ThermalFault']}}
+        out = pw.alerts(jsonformat=True, alertsonly=False)
+        assert isinstance(out, str)
+        data = json.loads(out)
+        assert {'TETHC--X--SN123': 'ThermalFault'} in data

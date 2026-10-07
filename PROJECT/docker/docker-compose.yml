@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  # 1. EMQX 5.x MQTT Broker (支援標準 1883 與 TLS 8883 MQTTS)
+  emqx:
+    image: emqx/emqx:5.6.0
+    container_name: ems-emqx
+    restart: always
+    ports:
+      - "1883:1883"      # MQTT TCP
+      - "8883:8883"      # MQTTS TLS (案場邊緣端上傳)
+      - "8083:8083"      # MQTT WebSocket
+      - "8084:8084"      # MQTT WSS
+      - "18083:18083"    # EMQX Web 管理儀表板 (預設 admin / public)
+    environment:
+      - "EMQX_DASHBOARD__DEFAULT_USERNAME=admin"
+      - "EMQX_DASHBOARD__DEFAULT_PASSWORD=public"
+      - "EMQX_ALLOW_ANONYMOUS=true"
+    volumes:
+      - emqx_data:/opt/emqx/data
+      - emqx_log:/opt/emqx/log
+    networks:
+      - ems-network
+
+  # 2. TimescaleDB (PostgreSQL 16 + TimescaleDB 時間序列擴充)
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: ems-timescaledb
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=ems_db
+      - POSTGRES_USER=ems_user
+      - POSTGRES_PASSWORD=ems_password_secure123
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./init_timescaledb.sql:/docker-entrypoint-initdb.d/init_timescaledb.sql
+    networks:
+      - ems-network
+
+  # 3. Redis (即時狀態快取 + WebSocket Channel Layer + 任務佇列)
+  redis:
+    image: redis:7-alpine
+    container_name: ems-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - ems-network
+
+networks:
+  ems-network:
+    driver: bridge
+
+volumes:
+  emqx_data:
+  emqx_log:
+  timescaledb_data:
+  redis_data:

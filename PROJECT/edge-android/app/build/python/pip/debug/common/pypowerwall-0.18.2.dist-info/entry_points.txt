@@ -1,0 +1,2 @@
+[console_scripts]
+pypowerwall = pypowerwall.__main__:main

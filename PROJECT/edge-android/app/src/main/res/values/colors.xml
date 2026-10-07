@@ -1,0 +1,10 @@
+<resources>
+    <color name="primary">#00E676</color>
+    <color name="primary_dark">#00B0FF</color>
+    <color name="background_dark">#121212</color>
+    <color name="surface_dark">#1E1E1E</color>
+    <color name="solar_color">#FFD600</color>
+    <color name="grid_color">#00B0FF</color>
+    <color name="battery_color">#00E676</color>
+    <color name="home_color">#E040FB</color>
+</resources>

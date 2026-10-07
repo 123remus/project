@@ -1,0 +1,3159 @@
+# pyPowerWall - Tesla TEDAPI Class
+# -*- coding: utf-8 -*-
+"""
+ Tesla TEADAPI Class
+
+ This module allows you to access the Tesla Powerwall Gateway
+ TEDAPI on 192.168.91.1 as used by the Tesla One app.
+
+ Class:
+    TEDAPI(gw_pwd: str, debug: bool = False, pwcacheexpire: int = 5, timeout: int = 5,
+              pwconfigexpire: int = 5, host: str = GW_IP,
+              tedapi_api_version: str = "V2024_06") - Initialize TEDAPI
+
+ Parameters:
+    gw_pwd - Powerwall Gateway Password
+    debug - Enable Debug Output
+    pwcacheexpire - Cache Expiration in seconds
+    timeout - API Timeout in seconds
+    pwconfigexpire - Configuration Cache Expiration in seconds
+    host - Powerwall Gateway IP Address (default: 192.168.91.1)
+    tedapi_api_version - Query/protobuf set: "V2024_06" (default, legacy QueryType
+                         path) or "V2026_06" (Tesla-signed GraphQL / bearer path).
+                         Accepts a string or TEDAPIApiVersion.
+
+ Functions:
+    get_din() - Get the DIN from the Powerwall Gateway
+    get_config() - Get the Powerwall Gateway Configuration
+    get_status() - Get the Powerwall Gateway Status
+    connect() - Connect to the Powerwall Gateway
+    backup_time_remaining() - Get the time remaining in hours
+    battery_level() - Get the battery level as a percentage
+    vitals() - Use tedapi data to create a vitals dictionary
+    get_firmware_version() - Get the Powerwall Firmware Version
+    get_battery_blocks() - Get list of Powerwall Battery Blocks
+    get_components() - Get the Powerwall 3 Device Information
+    get_battery_block(din) - Get the Powerwall 3 Battery Block Information
+    get_pw3_vitals() - Get the Powerwall 3 Vitals Information
+    get_device_controller() - Get the Powerwall Device Controller Status
+    get_fan_speeds() - Get the fan speeds in RPM (PW2/PW+ PVAC fans, PW3 inverter fans)
+    get_remote_meter_readings() - Get Tesla Remote Meter (trm_mb) CT readings
+    get_native_api(path) - Fetch a classic gateway /api/* endpoint via customer login
+    get_native_meters_aggregates() - Get the gateway's native /api/meters/aggregates
+
+ Note:
+    This module requires access to the Powerwall Gateway. You can add a route to
+    using the command: sudo route add -host 192.168.91.1 <Powerwall_IP>
+    The Powerwall Gateway password is required to access the TEDAPI.
+
+ Author: Jason A. Cox
+ Date: 1 Jun 2024
+ For more information see https://github.com/jasonacox/pypowerwall
+"""
+# Lazy annotations so PEP 604 syntax (e.g. `str | None`) in signatures is not
+# evaluated at runtime — keeps import working on Python < 3.10.
+from __future__ import annotations
+
+import gzip
+import json
+import logging
+import math
+import sys
+import threading
+import time
+from functools import wraps
+from http import HTTPStatus
+from typing import Any, Dict, Final, List, Optional, Tuple, Union
+
+import requests
+import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.exceptions import InsecureRequestWarning
+
+from pypowerwall import __version__
+from pypowerwall.api_lock import acquire_lock_with_backoff
+from pypowerwall.helpers import lookup
+
+from .protobuf.V2024_06 import tedapi_pb2
+from .protobuf.V2024_06 import tedapi_combined_pb2 as combined_pb2
+from .api_version import TEDAPIApiVersion
+from .auth_mode import AuthMode
+from .queries import apply_query, get_query, QueryRole, EXTRA_SIGNAL_NAMES, PW3_FAN_SIGNAL_NAMES
+from .system_info import SystemInfo, V2026_SYS_SCHEMA, V2024_SYS_SCHEMA
+
+urllib3.disable_warnings(InsecureRequestWarning)
+
+# TEDAPI Fixed Gateway IP Address
+GW_IP = "192.168.91.1"
+
+# Gateway local API (customer login) constants - see issue #221
+# Bearer tokens from /api/login/Basic live ~1h; refresh well before that
+CUSTOMER_TOKEN_EXPIRE: Final[float] = 3000.0
+# Backoff before retrying an unavailable local API endpoint
+NATIVE_FAIL_RETRY: Final[float] = 300.0
+
+# Rate Limit Codes
+BUSY_CODES: Final[List[HTTPStatus]] = [HTTPStatus.TOO_MANY_REQUESTS, HTTPStatus.SERVICE_UNAVAILABLE]
+RETRY_FORCE_CODES: Final[List[int]] = [int(i) for i in [
+    HTTPStatus.BAD_GATEWAY,
+    HTTPStatus.GATEWAY_TIMEOUT,
+    HTTPStatus.INTERNAL_SERVER_ERROR,
+    HTTPStatus.SERVICE_UNAVAILABLE,
+    HTTPStatus.TOO_MANY_REQUESTS
+]]
+
+# Setup Logging
+log = logging.getLogger(__name__)
+log.debug('%s version %s', __name__, __version__)
+log.debug('Python %s on %s', sys.version, sys.platform)
+
+# Utility Functions
+# lookup() is imported (and re-exported) from pypowerwall.helpers - the
+# shared None-safe implementation used by all backends
+
+def uses_api_lock(func):
+    """Mark a getter as serialized by a per-instance, per-method API lock.
+
+    The wrapper injects the undecorated function as ``self_function`` so the
+    getter can hand it to ``_cached_fetch()``, which resolves the lock through
+    ``TEDAPI._api_lock()``. The lock lives on the *instance* (keyed by method
+    name), not on the function object: a process that polls several gateways
+    holds one TEDAPI per gateway, and a lock on the function would serialize
+    every gateway behind every other gateway's fetch.
+    """
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        # Inject the function object itself as ``self_function`` - positionally,
+        # so a caller's positional arguments map to the parameters after it
+        # (get_battery_block("DIN"), as documented above; injecting it as a
+        # keyword made that raise "got multiple values for 'self_function'").
+        kwargs.pop('self_function', None)
+        return func(self, func, *args, **kwargs)
+    return wrapper
+
+def decompress_response(content: bytes) -> bytes:
+    """
+    Decompress gzip-compressed response content if needed.
+
+    Firmware 25.42.2+ returns gzip-compressed responses from TEDAPI endpoints.
+    This function checks for the gzip magic bytes (0x1f 0x8b) and decompresses
+    if necessary.
+
+    Args:
+        content: Raw response content bytes
+
+    Returns:
+        Decompressed bytes if gzip-compressed, otherwise original content
+    """
+    if len(content) > 2 and content[0:2] == b'\x1f\x8b':
+        try:
+            return gzip.decompress(content)
+        except Exception as e:
+            log.debug(f"Gzip decompression failed: {e}")
+    return content
+
+def _component_signal_value(components, name):
+    """First non-None value of signal ``name`` across a ComponentsQuery component
+    list (e.g. ``data['components']['pch']``), or None. Tolerates missing or
+    None ``signals`` lists and non-dict entries - firmware varies."""
+    for component in components or []:
+        if not isinstance(component, dict):
+            continue
+        for signal in component.get('signals') or []:
+            if not isinstance(signal, dict) or signal.get('name') != name:
+                continue
+            if signal.get('value') is not None:
+                return signal['value']
+    return None
+
+def _extra_signals(variables_key):
+    """Signal names requested beyond the ComponentsQuery capture for one component
+    group (EXTRA_SIGNAL_NAMES, e.g. 'hvpSignalNames'). get_pw3_vitals passes each
+    through as delivered, so adding a name there is the only change needed."""
+    return EXTRA_SIGNAL_NAMES[QueryRole.COMPONENTS].get(variables_key, ())
+
+_CACHE_MISS = object()   # _cache_get(): "nothing fresh cached" (cached values are never None)
+
+# TEDAPI Class
+class TEDAPI:
+    def __init__(self, gw_pwd: str = "", debug: bool = False, pwcacheexpire: int = 5, timeout: int = 5,
+                 pwconfigexpire: int = 5, host: str = GW_IP, poolmaxsize: int = 10,
+                 v1r: bool = False, password: str | None = None, rsa_key_path: str | None = None,
+                 wifi_host: str | None = None,
+                 tedapi_api_version: TEDAPIApiVersion = TEDAPIApiVersion.V2024_06,
+                 auth_mode: AuthMode | str = AuthMode.BASIC,
+                 timezone: str = "America/Los_Angeles",
+                 failover: bool = True) -> None:
+        """Initialize the TEDAPI client for Powerwall Gateway communication.
+
+        failover (v1r with a wifi_host) selects what happens when the wired LAN
+        stops answering. True (default): after 3 consecutive LAN failures the
+        leader's queries move to the WiFi host, the LAN is re-tried on a
+        backoff (8 min doubling to ~2 h) and traffic returns to it once it
+        answers; a LAN that is down at connect starts on WiFi; and
+        get_native_api() also tries the WiFi host. False: strict - every
+        request uses the transport it is addressed to (leader on the LAN,
+        followers on the WiFi host) and returns None when that fails; nothing
+        is substituted or suppressed. Without a wifi_host there is nothing to
+        fail over to and the two are identical.
+
+        auth_mode selects how HTTP requests to the gateway are authenticated:
+        "basic" (default) uses HTTP Basic Auth against 192.168.91.1, which is
+        only reachable over the gateway's Wi-Fi; "bearer" logs in via
+        /api/login/Basic for a Bearer token and wraps each query in an
+        AuthEnvelope, which also works over the wired LAN IP. Bearer has been
+        verified on solar-only/inverter gateways; Powerwall 2 (Gateway 2) is
+        NOT supported — installer login returns 401 on wired LAN (see
+        jasonacox/pypowerwall-server#105). PW3 wired access is v1r's job.
+        Bearer is mutually exclusive with v1r (its own RSA transport).
+        """
+        self.debug = debug
+        # Query/protobuf version set: V2024_06 (default, hand-rolled captures) or
+        # V2026_06 (Tesla-signed pairs sent via the energy_device graphql path).
+        # Accepts a TEDAPIApiVersion or a plain string (e.g. from an env var / CLI).
+        self.tedapi_api_version = TEDAPIApiVersion.coerce(tedapi_api_version)
+        self.pwcachetime = {}  # holds the cached data timestamps for api
+        self.pwcacheexpire = pwcacheexpire  # seconds to expire status cache
+        self.pwconfigexpire = pwconfigexpire  # seconds to expire config cache
+        self.poolmaxsize = poolmaxsize # maximum size of the connection
+        self.pwcache = {}  # holds the cached data for api
+        self.timeout = timeout
+        self.timezone = timezone  # tz string for login clientInfo payloads
+        self.pwcooldown = 0
+        self.gw_ip = host
+        self.din = None
+        self.pw3 = False # Powerwall 3 Gateway only supports TEDAPI
+        self.v1r = v1r
+        self.v1r_transport = None
+        # Bearer auth support.
+        self.auth_mode = AuthMode.coerce(auth_mode)  # raises on unknown values
+        self.token = None  # Bearer token (only used in bearer mode)
+        if self.auth_mode == AuthMode.BEARER and v1r:
+            raise ValueError(f"auth_mode='{self.auth_mode}' is incompatible with v1r mode")
+        # Bearer is the AuthEnvelope transport modality that needs the Tesla-signed
+        # GraphQL query set introduced in V2026_06 (or anything newer — this is a minimum,
+        # not an exact match). Pairing it with the older V2024_06 QueryType queries
+        # wraps those legacy queries in the AuthEnvelope transport — a combination
+        # those gateways may reject or answer only partially. Warn (don't fail) so
+        # existing legacy+bearer setups keep working while surfacing the likely misconfiguration.
+        if (self.auth_mode == AuthMode.BEARER
+                and self.tedapi_api_version < TEDAPIApiVersion.V2026_06):
+            log.warning(
+                "auth_mode='%s' needs the signed-GraphQL query set introduced in "
+                "V2026_06, but tedapi_api_version='%s' is selected; legacy queries "
+                "sent over the bearer AuthEnvelope transport may be rejected or "
+                "return partial data. Set tedapi_api_version='V2026_06' or newer.",
+                self.auth_mode, self.tedapi_api_version)
+        # WiFi fallback for v1r mode.
+        # - Follower queries always use wifi_host when set.
+        # - Primary queries fall back to wifi_host when the wired LAN (v1r) is down.
+        # Only enabled when the caller explicitly provides a wifi_host string.
+        self.wifi_host = wifi_host
+        self.wifi_session = None
+        self.wifi_available = False
+        self.wifi_cooldown = 0      # timestamp when follower WiFi cooldown expires
+        self.wifi_last_success = 0  # timestamp of last successful WiFi call
+        self.wifi_fail_count = 0    # consecutive follower WiFi failures (exponential backoff)
+        self._wifi_lock = threading.Lock()  # protects wifi_fail_count and wifi_cooldown
+        # Per-method API locks for the @uses_api_lock getters, created lazily
+        # by _api_lock(). Per instance so multiple gateways (one TEDAPI each)
+        # never serialize on each other; per method so e.g. a slow
+        # get_device_controller() doesn't block get_config() on the same gateway.
+        self._api_locks: Dict[str, threading.Lock] = {}
+        self._api_locks_guard = threading.Lock()
+        # LAN (v1r) failover to the WiFi host — see failover in the docstring.
+        # lan_failed/lan_fail_count/lan_recover_after change only in the _lan_*
+        # methods, under _lan_lock (never held across a network call).
+        self.failover = bool(failover)
+        self.lan_failed = False     # True while leader queries route via WiFi
+        self.lan_fail_count = 0     # consecutive LAN failures
+        self.lan_recover_after = 0  # timestamp after which to retry LAN
+        self.lan_last_success = 0   # timestamp of last successful LAN call
+        self._lan_lock = threading.Lock()
+        # Single-flight connect(): getters run under different per-method locks,
+        # so several can find no DIN and call connect() at once. _connect_guard
+        # guards the _connecting claim only (never held across the connect).
+        self._connect_guard = threading.Lock()
+        self._connecting = False
+        # Gateway local API (classic /api/* endpoints) customer-login state.
+        # PW3 firmware still serves /api/meters/aggregates and friends behind a
+        # customer Bearer token from POST /api/login/Basic - see issue #221.
+        self.customer_token: Optional[str] = None
+        self.customer_token_time: float = 0.0
+        self.customer_host: Optional[str] = None
+        self.api_session: Optional[requests.Session] = None
+        # Reentrant so get_native_meters_aggregates can hold it across get_native_api
+        self._customer_lock = threading.RLock()
+        self._native_fail_until: float = 0.0  # backoff when endpoint unavailable
+        if v1r:
+            if not password or not rsa_key_path:
+                raise ValueError("v1r mode requires password and rsa_key_path")
+            from .tedapi_v1r import TEDAPIv1r
+            self.v1r_transport = TEDAPIv1r(
+                host=host, password=password, rsa_key_path=rsa_key_path,
+                timeout=timeout, poolmaxsize=poolmaxsize
+            )
+            self.gw_pwd = gw_pwd or ""
+            # Enable WiFi fallback only when an explicit wifi_host was provided
+            if gw_pwd and self.wifi_host:
+                self._init_wifi_session(gw_pwd)
+        else:
+            if not gw_pwd:
+                raise ValueError("Missing gw_pwd")
+            self.gw_pwd = gw_pwd
+        if self.debug:
+            self.set_debug(True)
+        log.debug(f"TEDAPI initialized with auth_mode={self.auth_mode}, pwcacheexpire={self.pwcacheexpire}s, pwconfigexpire={self.pwconfigexpire}s, v1r={self.v1r}")
+        # Connect to Powerwall Gateway
+        if not self.connect():
+            log.error("Failed to connect to Powerwall Gateway")
+
+
+    # TEDAPI Functions
+    def set_debug(self, toggle=True, color=True):
+        """Enable or disable verbose logging for TEDAPI."""
+        if toggle:
+            if color:
+                logging.basicConfig(format='\x1b[31;1m%(levelname)s:%(message)s\x1b[0m', level=logging.DEBUG)
+            else:
+                logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.DEBUG)
+            log.setLevel(logging.DEBUG)
+            log.debug("%s [%s]\n" % (__name__, __version__))
+        else:
+            log.setLevel(logging.NOTSET)
+
+    # ── Cached gateway fetches ────────────────────────────────────────────
+    #
+    # Every data getter (get_din, get_config, get_status, get_device_controller,
+    # get_firmware_version, get_components, get_battery_block) is the same
+    # skeleton around a different fetch: serve a fresh cache entry, honor the
+    # rate-limit cooldown, take the per-method lock, fetch, cache. _cached_fetch
+    # is that skeleton; a getter contributes only its cache key, expiry and
+    # fetch. Results live in self.pwcache / self.pwcachetime (keyed by name, or
+    # by DIN for battery blocks) so callers and tests can seed or inspect them.
+
+    def _cache_get(self, key: str, expire: float, force: bool = False):
+        """The cached value for ``key`` if it is younger than ``expire`` seconds
+        and ``force`` is not set, else _CACHE_MISS."""
+        if force:
+            return _CACHE_MISS
+        # .get(), not check-then-index: another thread (e.g. _write_config's
+        # invalidation) may pop the entry in between, which raised KeyError.
+        stamp = self.pwcachetime.get(key)
+        value = self.pwcache.get(key, _CACHE_MISS)
+        if stamp is None or value is _CACHE_MISS:
+            return _CACHE_MISS
+        age = time.time() - stamp
+        # A negative age means the wall clock stepped back (NTP): treat the
+        # entry as expired rather than fresh for the size of the step.
+        if 0 <= age < expire:
+            log.debug(f"Using Cached {key} (age: {age:.2f}s, expire: {expire}s)")
+            return value
+        log.debug(f"Cache expired for {key} (age: {age:.2f}s, expire: {expire}s)")
+        return _CACHE_MISS
+
+    def _cache_put(self, key: str, value) -> None:
+        self.pwcachetime[key] = time.time()
+        self.pwcache[key] = value
+
+    def _in_cooldown(self) -> bool:
+        """True while the 5-minute rate-limit cooldown (set on 429/503) runs."""
+        if self.pwcooldown > time.perf_counter():
+            log.debug('Rate limit cooldown period - Pausing API calls')
+            return True
+        return False
+
+    def _api_lock(self, self_function) -> Optional[threading.Lock]:
+        """The lock serializing ``self_function`` on *this* instance.
+
+        Created on first use and keyed by the getter's name, so each TEDAPI
+        instance (gateway) has its own set of per-method locks. ``None`` in
+        (a getter called without the decorator, e.g. directly in tests) is
+        ``None`` out, which ``acquire_lock_with_backoff`` treats as "no lock".
+        """
+        if self_function is None:
+            return None
+        name = getattr(self_function, '__name__', None) or str(self_function)
+        with self._api_locks_guard:
+            return self._api_locks.setdefault(name, threading.Lock())
+
+    def _cached_fetch(self, key: str, *, expire: float, force: bool, self_function,
+                      fetch, name: str):
+        """Skeleton shared by the locked, cached getters.
+
+        1. Serve a fresh cache entry, else bail out during a rate-limit cooldown
+           — both checked before taking the lock, so pollers don't queue behind
+           a fetch they don't need (``force`` skips both).
+        2. Take the per-instance, per-method lock (``_api_lock(self_function)``,
+           keyed by the @uses_api_lock getter's name; bounded wait). On timeout
+           serve the stale cache entry if there is one, else None — never raise
+           into a poller.
+        3. Under the lock re-check cache and cooldown (another thread may have
+           refreshed while we waited), and reconnect if the DIN is unknown.
+        4. ``fetch()`` returns the value to cache and return, or None to leave
+           the cache alone (the transport produced nothing); an exception is
+           logged as ``Error fetching {name}`` and also yields None."""
+        cached = self._cache_get(key, expire, force)
+        if cached is not _CACHE_MISS:
+            return cached
+        if not force and self._in_cooldown():
+            return None
+        try:
+            with acquire_lock_with_backoff(self._api_lock(self_function), self.timeout):
+                cached = self._cache_get(key, expire, force)
+                if cached is not _CACHE_MISS:
+                    return cached
+                if not force and self._in_cooldown():
+                    return None
+                if not self.din and not self.connect():
+                    log.error(f"Not Connected - Unable to get {name}")
+                    return None
+                log.debug(f"Get {name} from Powerwall")
+                try:
+                    data = fetch()
+                except Exception as e:
+                    log.error(f"Error fetching {name}: {e}")
+                    return None
+                if data is None:
+                    return None
+                log.debug(f"{name}: {data}")
+                self._cache_put(key, data)
+                return data
+        except TimeoutError:
+            log.error(f'Timeout waiting for API lock - unable to fetch {name} - '
+                      'returning cached data if available')
+            return self.pwcache.get(key)
+
+    @staticmethod
+    def _decode_json(payload: Optional[str], *, strict: bool = False) -> Optional[dict]:
+        """json.loads for a query payload. A missing (None) or malformed payload
+        is logged and degrades to {} — the long-standing contract of get_status,
+        get_device_controller, get_battery_block and get_config, whose callers
+        see an empty answer for the cache window. With ``strict`` it returns
+        None instead, so the caller leaves its cache alone and the next poll
+        retries (get_components: a cached {} would also starve get_pw3_vitals);
+        a missing payload then skips the decode entirely, with no 'NoneType'
+        decode error logged. A well-formed "{}" is {} either way."""
+        if strict and payload is None:
+            return None
+        try:
+            return json.loads(payload)
+        except (json.JSONDecodeError, TypeError) as e:
+            log.error(f"Error Decoding JSON: {e}")
+            return None if strict else {}
+
+    def _fetch_query(self, role: QueryRole, *, recipient_din: Optional[str] = None,
+                     sender_din: Optional[str] = None, tail: int = 1,
+                     din: Optional[str] = None,
+                     url_suffix: str = '/tedapi/v1', use_wifi: bool = False,
+                     strict: bool = False) -> Optional[dict]:
+        """One TEDAPI query end to end: build the request for ``role``
+        (_build_request), post it (_post_tedapi, or _post_tedapi_wifi for a v1r
+        follower), decode the answer (_parse_response + JSON). Returns the
+        payload dict, or None when the transport produced no response so the
+        caller leaves its cache alone. A response whose payload is missing or
+        malformed decodes to {} (logged) by default, or to None with
+        ``strict`` — see _decode_json."""
+        request_bytes = self._build_request(
+            role, recipient_din=recipient_din, sender_din=sender_din, tail=tail)
+        if use_wifi:
+            response = self._post_tedapi_wifi(request_bytes, url_suffix=url_suffix)
+        else:
+            response = self._post_tedapi(request_bytes, din=din, url_suffix=url_suffix)
+        if response is None:
+            return None
+        payload = self._parse_response(response, from_wifi=use_wifi)
+        return self._decode_json(payload, strict=strict)
+
+    def get_din(self, force=False):
+        """Get the Device Identification Number (DIN) from the Powerwall Gateway.
+
+        Unlike the other getters this takes no lock and never reconnects —
+        connect() calls it to establish the connection — and it lets a
+        transport exception propagate so connect() can log its routing advice."""
+        cached = self._cache_get("din", self.pwcacheexpire, force)
+        if cached is not _CACHE_MISS:
+            return cached
+        if not force and self._in_cooldown():
+            return None
+
+        def fetch_http():
+            """GET /tedapi/din on the primary session (basic and bearer modes)."""
+            r = self.session.get(f'https://{self.gw_ip}/tedapi/din', timeout=self.timeout)
+            if r.status_code in BUSY_CODES:
+                # Rate limited - Switch to cooldown mode for 5 minutes
+                self.pwcooldown = time.perf_counter() + 300
+                log.error('Possible Rate limited by Powerwall at - Activating 5 minute cooldown')
+                return None
+            if r.status_code == HTTPStatus.FORBIDDEN:
+                log.error("Access Denied: Check your Gateway Password")
+                return None
+            if r.status_code != HTTPStatus.OK:
+                log.error(f"Error fetching DIN: {r.status_code}")
+                return None
+            try:
+                # Firmware 25.42.2+ returns gzip-compressed DIN response
+                din = decompress_response(r.content).decode('utf-8').strip()
+            except UnicodeDecodeError as e:
+                log.error(f"Error decoding DIN response: {e}")
+                return None
+            log.debug(f"Connected: Powerwall Gateway DIN: {din}")
+            return din
+
+        log.debug("Fetching DIN from Powerwall...")
+        if not self.v1r:
+            din = fetch_http()
+        elif self.lan_failed:
+            din = self._fetch_wifi_din()
+        else:
+            din = self.v1r_transport.get_din()
+        if din:
+            self._cache_put("din", din)
+        return din
+
+
+    @uses_api_lock
+    def get_config(self, self_function=None, force=False) -> Optional[Dict[Any, Any]]:
+        """
+        Get the Powerwall Gateway Configuration
+
+        Payload:
+        {
+            "auto_meter_update": true,
+            "battery_blocks": [],
+            "bridge_inverter": {},
+            "client_protocols": {},
+            "credentials": [],
+            "customer": {},
+            "default_real_mode": "self_consumption",
+            "dio": {},
+            "enable_inverter_meter_readings": true,
+            "freq_shift_load_shed": {},
+            "freq_support_parameters": {},
+            "industrial_networks": {},
+            "installer": {},
+            "island_config": {},
+            "island_contactor_controller": {},
+            "logging": {},
+            "meters": [],
+            "site_info": {},
+            "solar": {},
+            "solars": [],
+            "strategy": {},
+            "test_timers": {},
+            "vin": "1232100-00-E--TG11234567890"
+        }
+        """
+        def fetch_config():
+            """One config.json fetch on whichever transport is live. v1r reads
+            it through the FileStore API over the LAN; basic and bearer send the
+            legacy config.send protobuf through the shared transport, as does
+            v1r while its LAN is down and a WiFi fallback session exists
+            (straight to _post_tedapi_wifi — that request must not take
+            _post_tedapi's LAN route). ``battery_blocks`` is normalized to a
+            list, which callers rely on. Returns the config dict, or None when
+            nothing came back."""
+            wifi_fallback = self.v1r and self.lan_failed and bool(self.wifi_session)
+            if self.v1r and not wifi_fallback:
+                data = self.v1r_transport.get_config_v1r(self.din)
+            else:
+                request_bytes = self._build_config_request()
+                if wifi_fallback:
+                    log.debug("get_config: LAN down, falling back to WiFi TEDAPI")
+                    response = self._post_tedapi_wifi(request_bytes)
+                else:
+                    response = self._post_tedapi(request_bytes)
+                if response is None:
+                    return None
+                data = self._decode_json(
+                    self._parse_legacy_response(response, from_wifi=wifi_fallback, config=True))
+            if data is not None:
+                data.setdefault("battery_blocks", [])
+            return data
+
+        return self._cached_fetch("config", expire=self.pwconfigexpire, force=force,
+                                  self_function=self_function, name="config",
+                                  fetch=fetch_config)
+
+    def _write_config(self, updates: dict) -> bool:
+        """
+        Write config.json via v1r filestore updateFileRequest (read-modify-write).
+
+        Args:
+            updates: dict of dotted paths to values, e.g. {'site_info.backup_reserve_percent': 5}
+        Returns:
+            True on success, False on error.
+        """
+        if not self.v1r or not self.v1r_transport:
+            log.error("_write_config requires v1r transport")
+            return False
+        if not self.din:
+            if not self.connect():
+                log.error("Not connected - unable to write config")
+                return False
+        try:
+            result = self.v1r_transport.write_config_v1r(self.din, updates)
+            if result:
+                # Invalidate config cache
+                self.pwcache.pop("config", None)
+                self.pwcachetime.pop("config", None)
+                return True
+            return False
+        except Exception as e:
+            log.error(f"Error writing config: {e}")
+            return False
+
+    def go_off_grid(self) -> Optional[dict]:
+        """Request intentional islanding through the signed v1r transport."""
+        if not self.v1r or not self.v1r_transport:
+            log.error("go_off_grid requires v1r transport")
+            return None
+        if not self.din and not self.connect():
+            log.error("Not connected - unable to go off grid")
+            return None
+        return self.v1r_transport.send_island_mode(self.din, mode=6, force=True)
+
+    def reconnect_grid(self) -> Optional[dict]:
+        """Request grid reconnection through the signed v1r transport."""
+        if not self.v1r or not self.v1r_transport:
+            log.error("reconnect_grid requires v1r transport")
+            return None
+        if not self.din and not self.connect():
+            log.error("Not connected - unable to reconnect grid")
+            return None
+        return self.v1r_transport.send_island_mode(self.din, mode=1)
+
+    # ── Max Backup (TEGMessages) ─────────────────────────────────────
+
+    def schedule_max_backup(self, duration_seconds=7200):
+        """
+        Schedule manual backup event (max backup / storm watch mode).
+
+        Sets reserve to 100% for the specified duration via TEGMessages.
+        Automatically cancels any existing backup event first — the gateway
+        requires cancel before setting a new one.
+
+        Args:
+            duration_seconds: Duration in seconds (default 7200 = 2 hours, min 60)
+
+        Returns:
+            True on success, False on error.
+        """
+        if not self.v1r or not self.v1r_transport:
+            log.error("schedule_max_backup requires v1r transport")
+            return False
+        if not self.din:
+            if not self.connect():
+                log.error("Not connected - unable to schedule max backup")
+                return False
+        duration_seconds = max(60, int(duration_seconds))
+        try:
+            # Must cancel any existing (active or expired) before scheduling new
+            self.cancel_max_backup()
+            from google.protobuf.timestamp_pb2 import Timestamp  # pylint: disable=no-name-in-module
+            teg = combined_pb2.TEGMessages()
+            req = teg.schedule_manual_backup_event_request
+            req.scheduling_info.start_time.CopyFrom(Timestamp(seconds=int(time.time())))
+            req.scheduling_info.duration_seconds = duration_seconds
+            req.scheduling_info.priority = (1 << 64) - 1  # MAX_UINT64 = highest priority
+            resp = self.v1r_transport.send_teg_message(self.din, teg)
+            if resp is None:
+                log.error("schedule_max_backup: no response")
+                return False
+            if resp.HasField('teg') and resp.teg.HasField('schedule_manual_backup_event_response'):
+                log.info(f"Max backup scheduled for {duration_seconds}s")
+                return True
+            log.warning(f"schedule_max_backup: unexpected response payload")
+            return False
+        except Exception as e:
+            log.error(f"schedule_max_backup error: {e}")
+            return False
+
+    def cancel_max_backup(self):
+        """
+        Cancel the current manual backup event.
+
+        Returns:
+            True on success, False on error.
+        """
+        if not self.v1r or not self.v1r_transport:
+            log.error("cancel_max_backup requires v1r transport")
+            return False
+        if not self.din:
+            if not self.connect():
+                log.error("Not connected - unable to cancel max backup")
+                return False
+        try:
+            teg = combined_pb2.TEGMessages()
+            teg.cancel_manual_backup_event_request.SetInParent()
+            resp = self.v1r_transport.send_teg_message(self.din, teg)
+            if resp is None:
+                log.error("cancel_max_backup: no response")
+                return False
+            if resp.HasField('teg') and resp.teg.HasField('cancel_manual_backup_event_response'):
+                log.info("Max backup cancelled")
+                return True
+            log.warning(f"cancel_max_backup: unexpected response payload")
+            return False
+        except Exception as e:
+            log.error(f"cancel_max_backup error: {e}")
+            return False
+
+    def get_backup_events(self):
+        """
+        Get current backup events.
+
+        Returns:
+            Dict with 'manual_backup' (dict or None) and 'backup_events' (list),
+            or None on error.
+        """
+        if not self.v1r or not self.v1r_transport:
+            log.error("get_backup_events requires v1r transport")
+            return None
+        if not self.din:
+            if not self.connect():
+                log.error("Not connected - unable to get backup events")
+                return None
+        try:
+            teg = combined_pb2.TEGMessages()
+            teg.get_backup_events_request.SetInParent()
+            resp = self.v1r_transport.send_teg_message(self.din, teg)
+            if resp is None:
+                log.error("get_backup_events: no response")
+                return None
+            if resp.HasField('teg') and resp.teg.HasField('get_backup_events_response'):
+                events_resp = resp.teg.get_backup_events_response
+                result = {
+                    'manual_backup': None,
+                    'backup_events': []
+                }
+                # Parse manual backup event if present
+                if events_resp.HasField('manual_backup_event'):
+                    mbe = events_resp.manual_backup_event
+                    si = mbe.scheduling_info
+                    end_time = si.start_time.seconds + si.duration_seconds
+                    active = int(time.time()) < end_time
+                    result['manual_backup'] = {
+                        'start_time': si.start_time.seconds,
+                        'duration_seconds': si.duration_seconds,
+                        'end_time': end_time,
+                        'active': active,
+                        'priority': si.priority,
+                    }
+                # Parse scheduled backup events
+                for evt in events_resp.backup_events:
+                    si = evt.scheduling_info
+                    result['backup_events'].append({
+                        'id': evt.id,
+                        'name': evt.name,
+                        'start_time': si.start_time.seconds,
+                        'duration_seconds': si.duration_seconds,
+                        'priority': si.priority,
+                    })
+                return result
+            log.warning(f"get_backup_events: unexpected response payload")
+            return None
+        except Exception as e:
+            log.error(f"get_backup_events error: {e}")
+            return None
+
+    @uses_api_lock
+    def get_status(self, self_function=None, force=False) -> Optional[Dict[Any, Any]]:
+        """
+        Get the Powerwall Gateway Status
+
+        Payload:
+        {
+            "control": {
+                "alerts": {},
+                "batteryBlocks": [],
+                "islanding": {},
+                "meterAggregates": [],
+                "pvInverters": [],
+                "siteShutdown": {},
+                "systemStatus": {}
+                },
+            "esCan": {
+                "bus": {
+                    "ISLANDER": {},
+                    "MSA": {},
+                    "PINV": [],
+                    "POD": [],
+                    "PVAC": [],
+                    "PVS": [],
+                    "SYNC": {},
+                    "THC": []
+                    },
+                "enumeration": null,
+                "firmwareUpdate": {},
+                "inverterSelfTests": null,
+                "phaseDetection": null
+                },
+            "neurio": {
+                "isDetectingWiredMeters": false,
+                "pairings": [],
+                "readings": []
+                },
+            "pw3Can": {},
+            "system": {}
+        }
+        """
+        return self._cached_fetch("status", expire=self.pwcacheexpire, force=force,
+                                  self_function=self_function, name="status",
+                                  fetch=lambda: self._fetch_query(QueryRole.DEVICE_CONTROLLER_BASIC))
+
+
+    @uses_api_lock
+    def get_device_controller(self, self_function=None, force=False):
+        """
+        Get the Powerwall Device Controller Status.
+        Similar to get_status but with additional data:
+        {
+            "components": {}, // Additional data
+            "control": {},
+            "esCan": {},
+            "ieee20305": {}, // Additional data
+            "neurio": {},
+            "pw3Can": {},
+            "system": {},
+            "teslaRemoteMeter": {} // Additional data
+        }
+
+        TODO: Refactor to combine tedapi queries
+        """
+        return self._cached_fetch("controller", expire=self.pwcacheexpire, force=force,
+                                  self_function=self_function, name="controller data",
+                                  fetch=lambda: self._fetch_query(QueryRole.DEVICE_CONTROLLER_FULL))
+
+
+    @uses_api_lock
+    def get_firmware_version(self, self_function=None, force=False, details=False):
+        """
+        Get the Powerwall Firmware Version.
+        Args:
+            force (bool): Force a refresh of the firmware version
+            details (bool): Return additional system information including
+                            gateway part number, serial number, and wireless devices
+        Example payload (details=True):
+            {
+                "system": {
+                    "gateway": {"partNumber": ..., "serialNumber": ...},
+                    "din": ..., "version": {"text": ..., "githash": ...}, ...
+                }
+            }
+        """
+        # The cache holds the SystemInfo, so a cache hit can answer either shape.
+        info = self._cached_fetch("firmware", expire=self.pwcacheexpire, force=force,
+                                  self_function=self_function, name="firmware version",
+                                  fetch=self._get_system_info)
+        if info is None:
+            return None
+        return info.to_details_dict() if details else info.version
+
+    def _get_system_info(self) -> Optional[SystemInfo]:
+        """Fetch the gateway firmware/system info and normalize it into a
+        :class:`SystemInfo`, identically across protobuf versions and transports.
+
+        V2026_06 uses the common.getSystemInfoRequest API; older versions use the
+        legacy firmware.request/firmware.system format. Returns the SystemInfo, or
+        None if nothing came back.
+        """
+        if self.tedapi_api_version < TEDAPIApiVersion.V2026_06:
+            pb = tedapi_pb2.Message()
+            pb.message.deliveryChannel = 1
+            pb.message.sender.local = 1
+            pb.message.recipient.din = self.din  # DIN of the Tesla Energy Gateway
+            pb.message.firmware.request = ""
+            pb.tail.value = 1
+        else:
+            tx, ed = self._import_v2026_pb2()
+            pb = tx.Message()
+            pb.message.deliveryChannel = ed.DELIVERY_CHANNEL_LOCAL_HTTPS
+            pb.message.sender.local = ed.LOCAL_PARTICIPANT_INSTALLER
+            pb.message.recipient.din = self.din  # DIN of the Tesla Energy Gateway
+            pb.message.common.getSystemInfoRequest.CopyFrom(
+                ed.CommonAPIGetSystemInfoRequest())
+            pb.tail.value = 1
+        response = self._post_tedapi(pb.SerializeToString())
+        if response is None:
+            return None
+        return self._parse_system_info(response)
+
+    def _parse_system_info(self, response: bytes) -> SystemInfo:
+        """Parse a firmware/system-info response into a SystemInfo. The two api
+        versions differ only in the pb2 module and the protobuf field paths
+        (V2026_SYS_SCHEMA / V2024_SYS_SCHEMA); SystemInfo.from_proto does the rest."""
+
+        if self.tedapi_api_version < TEDAPIApiVersion.V2026_06:
+            envelope_cls, message_cls, schema = (
+                tedapi_pb2.MessageEnvelope, tedapi_pb2.Message, V2024_SYS_SCHEMA)
+        else:
+            tx, ed = self._import_v2026_pb2()
+            envelope_cls, message_cls, schema = ed.MessageEnvelope, tx.Message, V2026_SYS_SCHEMA
+
+        # v1r and bearer transports hand back a bare MessageEnvelope (no outer
+        # Message/Tail); basic returns the full Message. Both the class choice and
+        # the unwrap must follow the same test — see _parse_response.
+        bare = self.v1r or self.auth_mode == AuthMode.BEARER
+        env = envelope_cls() if bare else message_cls()
+        env.ParseFromString(response)
+        return SystemInfo.from_proto(env if bare else env.message, schema)
+
+    @uses_api_lock
+    def get_components(self, self_function=None, force=False):
+        """
+        Get Powerwall 3 device component information.
+        Example payload:
+            {
+                "components": {
+                    "pch": [...],
+                    "bms": [...],
+                    ...
+                }
+            }
+        An empty or malformed payload is an uncached None (``strict``), not the
+        {} the other queries degrade to: get_pw3_vitals treats None as "no
+        components" and a cached {} would suppress retries for the config-expiry
+        window (and the proxy's /tedapi/components would serve "{}" for "null").
+        """
+        return self._cached_fetch("components", expire=self.pwconfigexpire, force=force,
+                                  self_function=self_function, name="components",
+                                  fetch=lambda: self._fetch_query(QueryRole.COMPONENTS,
+                                                                  strict=True))
+
+
+    def get_pw3_vitals(self, force=False):
+        """
+        Get Powerwall 3 Battery Vitals Data.
+        Returns:
+        {
+            "PVAC--{part}--{sn}" {
+                "PVAC_PvState_A": "PV_Active",
+                "PVAC_PVCurrent_A": 0.0,
+                ...
+                "PVAC_PVMeasuredVoltage_A": 0.0,
+                ...
+                "PVAC_PVMeasuredPower_A": 0.0,
+                ...
+                "PVAC_Fout": 60.0,
+                "PVAC_Pout": 0.0,
+                "PVAC_State": X,
+                "PVAC_VL1Ground": lookup(p, ['PVAC_Logging', 'PVAC_VL1Ground']),
+                "PVAC_VL2Ground": lookup(p, ['PVAC_Logging', 'PVAC_VL2Ground']),
+                "PVAC_Vout": lookup(p, ['PVAC_Status', 'PVAC_Vout']),
+                "manufacturer": "TESLA",
+                "partNumber": packagePartNumber,
+                "serialNumber": packageSerialNumber,
+            }.
+            "PVS--{part}--{sn}" {
+                "PVS_StringA_Connected": true,
+                ...
+            },
+            "TEPOD--{part}--{sn}" {
+                "alerts": [],
+                "POD_nom_energy_remaining": 0.0,
+                "POD_nom_full_pack_energy": 0.0,
+                "POD_nom_energy_to_be_charged": 0.0,
+                # EXTRA_SIGNAL_NAMES bms/hvp signals as delivered (None if unavailable)
+                "BMS_LOG_tempOutOfBounds": 0,     # over-temperature event counters
+                "BMS_LOG_tempOutOfBoundsCharge": 0,
+                "HVP_PackTempMax": 40.3,          # degrees C
+                "HVP_PackTempMin": 35.6,
+                "HVP_ShuntTemperature": 41.3,
+            },
+            "TEPINV--{part}--{sn}" {
+                # EXTRA_SIGNAL_NAMES pch signals as delivered (None if unavailable)
+                "PCH_AmbientTemp": 47.2,          # degrees C
+                "PCH_heatsinkTemp": 45.45,        # constant on current firmware
+                "PCH_FanSpeed_A": 1395,           # inverter fans A/B, measured RPM
+                "PCH_FanSpeed_B": 1397,
+                "PCH_FanDuty_A": 19.1,            # fan drive duty cycle, percent
+                "PCH_FanDuty_B": 19.1,
+                "PINV_Fout": 60.0,
+                ...
+            }
+        }
+        """
+        # Read methods return None on failure, never raise: this method calls
+        # the transport directly (not through _cached_fetch), so a gateway
+        # timeout or malformed payload used to propagate into vitals(),
+        # get_blocks() and /api/meters/aggregates.
+        try:
+            return self._pw3_vitals(force)
+        except Exception as e:
+            log.error(f"Error getting Powerwall 3 vitals: {e}")
+            return None
+
+    def _pw3_vitals(self, force):
+        """get_pw3_vitals() body; may raise (the public method logs and returns None)."""
+        # Check Connection
+        if not self.din:
+            if not self.connect():
+                log.error("Not Connected - Unable to get configuration")
+                return None
+        # Check Cache
+        # Live data (PV, power, pack energy): the data-cache expiry, not the
+        # config one (a direct TEDAPI user may set pwconfigexpire much higher)
+        cached = self._cache_get("pw3_vitals", self.pwcacheexpire, force)
+        if cached is not _CACHE_MISS:
+            return cached
+        if not force and self._in_cooldown():
+            return None
+        components = self.get_components(force=force)
+        din = self.din
+        if not components:
+            log.error("Unable to get Powerwall 3 Components")
+            return None
+
+        response = {}
+        config = self.get_config(force=force)
+        if not isinstance(config, dict):
+            log.error("Unable to get configuration for Powerwall 3 vitals")
+            return None
+        battery_blocks = config.get('battery_blocks') or []
+
+        # Check to see if there is only one Powerwall
+        single_pw = False
+        if battery_blocks and len(battery_blocks) == 1:
+            single_pw = True
+        # Loop through all the battery blocks (Powerwalls)
+        for battery in battery_blocks:
+            pw_din = battery['vin'] # 1707000-11-J--TG12xxxxxx3A8Z
+            pw_part, pw_serial = pw_din.split('--')
+            battery_type = battery['type']
+            if "Powerwall3" not in battery_type:
+                continue
+            # Determine if this is a follower that needs WiFi fallback
+            is_follower = (pw_din != self.din)
+            use_wifi = False
+            if self.v1r and is_follower:
+                if not self.wifi_session:
+                    log.debug("v1r: Skipping follower %s (no WiFi session)", pw_din)
+                    continue
+                use_wifi = True
+                log.debug("v1r: Querying follower %s via WiFi", pw_din)
+            # Fetch Device ComponentsQuery from each Powerwall
+            if single_pw:
+                url_suffix = '/tedapi/v1'
+            else:
+                url_suffix = f'/tedapi/device/{pw_din}/v1'
+            # single_pw -> local sender, tail 1, basic URL; multi -> follower
+            # routed via the primary DIN (sender), tail 2, per-device URL
+            request_bytes = self._build_request(
+                QueryRole.COMPONENTS,
+                recipient_din=pw_din,
+                sender_din=None if single_pw else din,
+                tail=1 if single_pw else 2)
+            # One Powerwall's transport error (timeout, connection reset, bad
+            # protobuf) skips that Powerwall, not the whole vitals call
+            try:
+                if use_wifi:
+                    # WiFi fallback for follower — use WiFi session (standard protobuf response)
+                    api_response = self._post_tedapi_wifi(request_bytes, url_suffix=url_suffix)
+                else:
+                    api_response = self._post_tedapi(request_bytes, din=pw_din, url_suffix=url_suffix)
+                payload = None if api_response is None else \
+                    self._parse_response(api_response, from_wifi=use_wifi)
+            except Exception as e:
+                log.error(f"Error fetching components for {pw_din} - skipping: {e}")
+                continue
+            if api_response is not None:
+                if payload:
+                    # Guard the JSON parse and component access - a malformed or
+                    # partial follower payload should not abort the whole vitals call
+                    try:
+                        data = json.loads(payload)
+                        components = data['components']
+                        pch_components = components['pch']
+                    except (json.JSONDecodeError, KeyError, TypeError) as e:
+                        log.error(f"Error parsing component payload for {pw_din} - skipping: {e}")
+                        continue
+                    # TEDPOD
+                    alerts = []
+                    for component in components:
+                        # Guard the gateway payload - a malformed entry must not abort vitals
+                        first = (components[component] or [None])[0]
+                        if not isinstance(first, dict):
+                            continue
+                        for alert in first.get('activeAlerts') or []:
+                            name = alert.get('name') if isinstance(alert, dict) else None
+                            if name and name not in alerts:
+                                alerts.append(name)
+                    # Process all BMS and HVP components to support expansion packs
+                    # HVP entries have serial numbers, BMS entries have energy data
+                    # They correspond 1:1 by index
+                    bms_list = data['components'].get('bms', [])
+                    hvp_list = data['components'].get('hvp', [])
+
+                    # Get expansion pack DINs for this battery block
+                    expansion_dins = {}
+                    for exp in battery.get('battery_expansions', []):
+                        exp_din = exp.get('din', '')
+                        exp_parts = exp_din.split('--')
+                        if len(exp_parts) >= 2 and exp_parts[1]:
+                            exp_serial = exp_parts[1]
+                            expansion_dins[exp_serial] = exp_din
+
+                    # Process each BMS/HVP pair
+                    for bms_idx, bms_component in enumerate(bms_list):
+                        signals = bms_component.get('signals', [])
+                        nom_energy_remaining = 0
+                        nom_full_pack_energy = 0
+                        for signal in signals:
+                            if signal.get('value') is None:
+                                continue
+                            if "BMS_nominalEnergyRemaining" == signal['name']:
+                                nom_energy_remaining = int(signal['value'] * 1000)  # Convert to Wh
+                            elif "BMS_nominalFullPackEnergy" == signal['name']:
+                                nom_full_pack_energy = int(signal['value'] * 1000)  # Convert to Wh
+
+                        # Skip entries with no energy data
+                        if nom_full_pack_energy == 0:
+                            continue
+
+                        # Get corresponding HVP component and serial (same index)
+                        hvp_component = hvp_list[bms_idx] if bms_idx < len(hvp_list) else None
+                        if not isinstance(hvp_component, dict):
+                            hvp_component = {}
+                        hvp_serial = hvp_component.get('serialNumber')
+
+                        # Determine DIN for this BMS entry
+                        if bms_idx == 0:
+                            # First BMS is the main Powerwall unit
+                            pod_din = pw_din
+                        elif hvp_serial and hvp_serial in expansion_dins:
+                            # This is an expansion pack - use its full DIN
+                            pod_din = expansion_dins[hvp_serial]
+                        else:
+                            # BMS entry doesn't match main unit or known expansion - skip it
+                            # (This catches phantom BMS slots on batteries without expansions)
+                            continue
+
+                        response[f"TEPOD--{pod_din}"] = {
+                            "alerts": alerts,
+                            "POD_nom_energy_remaining": nom_energy_remaining,
+                            "POD_nom_energy_to_be_charged": nom_full_pack_energy - nom_energy_remaining,
+                            "POD_nom_full_pack_energy": nom_full_pack_energy,
+                        }
+                        # Extra signals as delivered; always present (None when unavailable)
+                        # so the block shape is stable
+                        pod = response[f"TEPOD--{pod_din}"]
+                        for name in _extra_signals('bmsSignalNames'):
+                            pod[name] = _component_signal_value([bms_component], name)
+                        for name in _extra_signals('hvpSignalNames'):
+                            pod[name] = _component_signal_value([hvp_component], name)
+                    # PVAC, PVS and TEPINV
+                    response[f"PVAC--{pw_din}"] = {}
+                    response[f"PVS--{pw_din}"] = {}
+                    # Extra inverter signals as delivered; None when unavailable
+                    response[f"TEPINV--{pw_din}"] = {
+                        name: _component_signal_value(pch_components, name)
+                        for name in _extra_signals('pchSignalNames')
+                    }
+                    # pch_components contain:
+                    #   PCH_PvState_A through F - textValue in [Pv_Active, Pv_Active_Parallel, Pv_Standby]
+                    #   PCH_PvVoltageA through F - value
+                    #   PCH_PvCurrentA through F - value
+                    # Loop through and find all the strings - PW3 has 6 strings A-F
+                    for n in ["A", "B", "C", "D", "E", "F"]:
+                        pv_state = "Unknown"
+                        pv_voltage = 0
+                        pv_current = 0
+                        for component in pch_components: # TODO: Probably better way to do this
+                            signals = component['signals']
+                            for signal in signals:
+                                if f'PCH_PvState_{n}' == signal['name']:
+                                    pv_state = signal['textValue']
+                                elif f'PCH_PvVoltage{n}' == signal['name']:
+                                    pv_voltage = signal['value'] if signal['value'] is not None and signal['value'] > 0 else 0
+                                elif f'PCH_PvCurrent{n}' == signal['name']:
+                                    pv_current = signal['value'] if signal['value'] is not None and signal['value'] > 0 else 0
+                                elif 'PCH_AcFrequency' == signal['name']:
+                                    response[f"PVAC--{pw_din}"]["PVAC_Fout"] = signal['value']
+                                    response[f"TEPINV--{pw_din}"]["PINV_Fout"] = signal['value']
+                                elif 'PCH_AcVoltageAN' == signal['name']:
+                                    response[f"PVAC--{pw_din}"]["PVAC_VL1Ground"] = signal['value']
+                                    response[f"TEPINV--{pw_din}"]["PINV_VSplit1"] = signal['value']
+                                elif 'PCH_AcVoltageBN' == signal['name']:
+                                    response[f"PVAC--{pw_din}"]["PVAC_VL2Ground"] = signal['value']
+                                    response[f"TEPINV--{pw_din}"]["PINV_VSplit2"] = signal['value']
+                                elif 'PCH_AcVoltageAB' == signal['name']:
+                                    response[f"PVAC--{pw_din}"]["PVAC_Vout"] = signal['value']
+                                    response[f"TEPINV--{pw_din}"]["PINV_Vout"] = signal['value']
+                                elif 'PCH_BatteryPower' == signal['name']: # not PCH_AcRealPowerAB
+                                    response[f"PVAC--{pw_din}"]["PVAC_Pout"] = signal['value']
+                                    response[f"TEPINV--{pw_din}"]["PINV_Pout"] = (signal['value'] or 0) / 1000
+                                elif 'PCH_AcMode' == signal['name']:
+                                    response[f"PVAC--{pw_din}"]["PVAC_State"] = signal['textValue']
+                                    response[f"TEPINV--{pw_din}"]["PINV_State"] = signal['textValue']
+                        pv_power = pv_voltage * pv_current # Calculate power
+                        response[f"PVAC--{pw_din}"][f"PVAC_PvState_{n}"] = pv_state
+                        response[f"PVAC--{pw_din}"][f"PVAC_PVMeasuredVoltage_{n}"] = pv_voltage
+                        response[f"PVAC--{pw_din}"][f"PVAC_PVCurrent_{n}"] = pv_current
+                        response[f"PVAC--{pw_din}"][f"PVAC_PVMeasuredPower_{n}"] = pv_power
+                        response[f"PVAC--{pw_din}"]["manufacturer"] = "TESLA"
+                        response[f"PVAC--{pw_din}"]["partNumber"] = pw_part
+                        response[f"PVAC--{pw_din}"]["serialNumber"] = pw_serial
+                        response[f"PVS--{pw_din}"][f"PVS_String{n}_Connected"] = ("Pv_Active" in pv_state)
+                else:
+                    log.debug(f"No payload for {pw_din}")
+            else:
+                log.debug(f"No response for {pw_din}")
+        # The cache read above was never paired with a write, so every caller
+        # (vitals(), get_blocks(), both /api/meters/aggregates sections) re-ran
+        # the per-Powerwall queries. An empty result isn't cached: retry next call.
+        if response:
+            self._cache_put("pw3_vitals", response)
+        return response
+
+
+    def get_battery_blocks(self, force=False):
+        """Return Powerwall battery blocks from configuration."""
+        config = self.get_config(force=force)
+        if not isinstance(config, dict):
+            log.error("Unable to get configuration for battery blocks")
+            return []
+        battery_blocks = config.get('battery_blocks') or []
+        return battery_blocks
+
+
+    @uses_api_lock
+    def get_battery_block(self, self_function=None, din=None, force=False):
+        """
+        Get the Powerwall 3 Battery Block Information.
+        Args:
+            din (str): DIN of Powerwall 3 to query
+            force (bool): Force a refresh of the battery block
+        Returns:
+            The ComponentsQuery answer from that Powerwall, e.g.
+            {"components": {"baggr": [...], "bms": [...], "hvp": [...],
+                            "pch": [...], "pws": [...]},
+             "pw3Can": {"firmwareUpdate": {...}}}
+            {} (logged, cached for pwcacheexpire) for an empty or malformed
+            payload; None when no DIN is given, the gateway doesn't answer, or
+            (v1r) a follower has no WiFi route.
+        Note: Provides 404 response for previous Powerwall versions
+        """
+        # Make sure we have a DIN
+        if not din:
+            log.error("No DIN specified - Unable to get battery block")
+            return None
+        # v1r cannot route queries to follower Powerwalls — use WiFi fallback
+        use_wifi = False
+        if self.v1r and din != self.din:
+            if not self.wifi_session:
+                log.debug("v1r: Cannot query follower battery block %s (no WiFi session)", din)
+                return None
+            use_wifi = True
+            log.debug("v1r: Querying follower battery block %s via WiFi", din)
+        # Follower routed via the primary DIN (sender), tail 2, per-device URL.
+        # The answer is an ordinary query response in payload.recv.text — the
+        # same one get_pw3_vitals() reads per Powerwall. From v0.10.8 until this
+        # fix it was read from config.recv.file.text (the config-file slot,
+        # which a query response never fills), so every basic/WiFi call decoded
+        # "" and returned {} with an "Error Decoding JSON" log. Verified
+        # 2026-09-26 on 2x PW3 (firmware 26.18.1, WiFi TEDAPI): ~12 KB of
+        # ComponentsQuery JSON per DIN in payload.recv.text, config slot empty.
+        return self._cached_fetch(
+            din, expire=self.pwcacheexpire, force=force, self_function=self_function,
+            name=f"battery block {din}",
+            fetch=lambda: self._fetch_query(
+                QueryRole.COMPONENTS, recipient_din=din, sender_din=self.din, tail=2,
+                din=din, url_suffix=f'/tedapi/device/{din}/v1', use_wifi=use_wifi))
+
+    def _init_session(self):
+        """Initialize and return a requests.Session for TEDAPI communication."""
+        session = requests.Session()
+        if self.poolmaxsize > 0:
+            retries = urllib3.Retry(
+                total=5,
+                backoff_factor=1,
+                status_forcelist=RETRY_FORCE_CODES,
+                raise_on_status=False
+            )
+            adapter = HTTPAdapter(max_retries=retries, pool_connections=self.poolmaxsize, pool_maxsize=self.poolmaxsize, pool_block=True)
+            session.mount("https://", adapter)
+        else:
+            session.headers.update({'Connection': 'close'})  # This disables keep-alive
+        session.verify = False
+        if self.auth_mode != AuthMode.BEARER:
+            # Bearer uses an Authorization header (set at login) plus the
+            # protobuf-layer AuthEnvelope(PRESENCE) added in _authenv_post.
+            # Only basic uses HTTP auth.
+            session.auth = ('Tesla_Energy_Device', self.gw_pwd)
+        session.headers.update({'Content-type': 'application/octet-stream'})
+        return session
+
+    def _init_wifi_session(self, gw_pwd: str):
+        """Initialize WiFi TEDAPI session for follower queries in v1r mode."""
+        session = requests.Session()
+        if self.poolmaxsize > 0:
+            # v1r only. Fail fast for the same reason as the v1r LAN session
+            # (tedapi_v1r._init_session): with the LAN down every primary query
+            # rides this session, so a dead fallback host must not hold the
+            # caller's API lock through a long retry chain either.
+            retries = urllib3.Retry(
+                total=1,
+                status_forcelist=RETRY_FORCE_CODES,
+                raise_on_status=False
+            )
+            adapter = HTTPAdapter(max_retries=retries, pool_connections=self.poolmaxsize, pool_maxsize=self.poolmaxsize, pool_block=True)
+            session.mount("https://", adapter)
+        else:
+            session.headers.update({'Connection': 'close'})
+        session.verify = False
+        session.auth = ('Tesla_Energy_Device', gw_pwd)
+        session.headers.update({'Content-type': 'application/octet-stream'})
+        self.wifi_session = session
+        log.debug(f"WiFi fallback session initialized for {self.wifi_host}")
+
+    def _test_wifi_path(self):
+        """Test WiFi TEDAPI connectivity by fetching DIN. Non-blocking."""
+        if not self.wifi_session:
+            return
+        try:
+            url = f'https://{self.wifi_host}/tedapi/din'
+            r = self.wifi_session.get(url, timeout=self.timeout)
+            if r.status_code == HTTPStatus.OK:
+                self.wifi_available = True
+                self.wifi_last_success = time.time()
+                log.info("WiFi follower path verified (%s)", self.wifi_host)
+            else:
+                self.wifi_available = False
+                log.warning("WiFi path returned status %d, followers will be skipped", r.status_code)
+        except Exception as e:
+            self.wifi_available = False
+            log.warning("WiFi path unreachable (%s), followers will be skipped: %s", self.wifi_host, e)
+
+    def _fetch_wifi_din(self) -> Optional[str]:
+        """The leader DIN read from the WiFi fallback host (v1r), or None."""
+        if not self.wifi_session:
+            return None
+        try:
+            r = self.wifi_session.get(f'https://{self.wifi_host}/tedapi/din', timeout=self.timeout)
+            if r.status_code != HTTPStatus.OK:
+                log.warning("WiFi fallback %s returned status %d for DIN", self.wifi_host, r.status_code)
+                return None
+            return decompress_response(r.content).decode('utf-8').strip() or None
+        except Exception as e:
+            log.error("WiFi fallback failed fetching DIN from %s: %s", self.wifi_host, e)
+            return None
+
+    def _post_tedapi_wifi(self, pb_bytes: bytes, url_suffix: str = '/tedapi/v1') -> Optional[bytes]:
+        """
+        POST protobuf bytes via WiFi TEDAPI (used for follower queries in v1r mode).
+
+        Args:
+            pb_bytes: Serialized protobuf payload (full tedapi_pb2.Message).
+            url_suffix: URL suffix (e.g., '/tedapi/v1' or '/tedapi/device/{din}/v1')
+
+        Returns:
+            Raw response content bytes, or None on error.
+        """
+        if not self.wifi_session:
+            return None
+        # Exponential backoff for follower WiFi failures (60s * 2^fail_count, max 128 min)
+        # Use a lock so concurrent threads don't all increment fail_count simultaneously
+        # and spike the backoff to maximum in one burst (issue #310).
+        with self._wifi_lock:
+            if self.wifi_cooldown > time.time():
+                remaining = self.wifi_cooldown - time.time()
+                log.debug("WiFi cooldown active (%.0fs remaining), skipping", remaining)
+                return None
+        # Re-test WiFi if previously unavailable and cooldown has expired
+        if not self.wifi_available:
+            self._test_wifi_path()
+            if not self.wifi_available:
+                with self._wifi_lock:
+                    # Re-check cooldown: another thread may have set one while we tested
+                    if self.wifi_cooldown <= time.time():
+                        self.wifi_fail_count += 1
+                        backoff = min(60 * (2 ** self.wifi_fail_count), 7680)  # caps at ~128 min
+                        self.wifi_cooldown = time.time() + backoff
+                        log.debug("WiFi unavailable, next retry in %.0fs (failure #%d)",
+                                   backoff, self.wifi_fail_count)
+                return None
+        url = f'https://{self.wifi_host}{url_suffix}'
+        try:
+            r = self.wifi_session.post(url, data=pb_bytes, timeout=self.timeout)
+            if r.status_code in BUSY_CODES:
+                log.warning("WiFi TEDAPI rate limited, activating 60s cooldown")
+                with self._wifi_lock:
+                    if self.wifi_cooldown <= time.time():
+                        self.wifi_fail_count += 1
+                        self.wifi_cooldown = time.time() + 60
+                return None
+            if r.status_code != HTTPStatus.OK:
+                log.error("WiFi TEDAPI error for %s: %s", url_suffix, r.status_code)
+                with self._wifi_lock:
+                    if self.wifi_cooldown <= time.time():
+                        self.wifi_fail_count += 1
+                        backoff = min(60 * (2 ** self.wifi_fail_count), 7680)
+                        self.wifi_cooldown = time.time() + backoff
+                self.wifi_available = False
+                return None
+            # Success — reset failure tracking (including a cooldown another
+            # thread set while this request was in flight: the path works)
+            self.wifi_available = True
+            with self._wifi_lock:
+                self.wifi_fail_count = 0
+                self.wifi_cooldown = 0
+                self.wifi_last_success = time.time()
+            return decompress_response(r.content)
+        except Exception as e:
+            log.error("WiFi TEDAPI request failed: %s", e)
+            with self._wifi_lock:
+                if self.wifi_cooldown <= time.time():
+                    self.wifi_fail_count += 1
+                    backoff = min(60 * (2 ** self.wifi_fail_count), 7680)
+                    self.wifi_cooldown = time.time() + backoff
+            self.wifi_available = False
+            return None
+
+    def _bearer_login(self):
+        """Authenticate via /api/login/Basic and store a Bearer token on the session."""
+        url = f'https://{self.gw_ip}/api/login/Basic'
+        payload = {
+            "username": "installer",
+            "password": self.gw_pwd,
+            "email": "installer@tesla.com",
+            "clientInfo": {"timezone": self.timezone},
+        }
+        log.debug(f"Bearer login to {url}")
+        r = self.session.post(url, json=payload, timeout=self.timeout)
+        r.raise_for_status()
+        data = r.json()
+        if "token" not in data:
+            raise ValueError("Login response missing 'token' field")
+        self.token = data["token"]
+        self.session.headers["Authorization"] = f"Bearer {self.token}"
+        log.debug(f"Bearer token acquired ({len(self.token)} chars)")
+
+    def _bearer_logout(self):
+        """Invalidate the Bearer token session (best-effort)."""
+        if not self.token:
+            return
+        try:
+            self.session.get(
+                f'https://{self.gw_ip}/api/logout',
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=self.timeout,
+            )
+        except Exception:
+            pass
+        self.token = None
+        self.session.headers.pop("Authorization", None)
+
+    def _authenv_post(self, envelope_bytes: bytes, url_suffix: str = '/tedapi/v1') -> Optional[bytes]:
+        """Bearer transport: wrap bare MessageEnvelope bytes in an AuthEnvelope,
+        POST it (the Bearer header rides on the session), and unwrap the
+        AuthEnvelope response back to bare MessageEnvelope bytes.
+
+        Takes envelope bytes, not a full transport Message: _post_tedapi strips
+        the Message/Tail wrapper (_envelope_bytes) before calling, exactly as it
+        does for v1r, so nothing here re-parses the request. Returns bare
+        MessageEnvelope bytes, or None on error.
+        """
+        auth = combined_pb2.AuthEnvelope()
+        auth.payload = envelope_bytes
+        auth.externalAuth.type = combined_pb2.EXTERNAL_AUTH_TYPE_PRESENCE
+        data = auth.SerializeToString()
+
+        url = f'https://{self.gw_ip}{url_suffix}'
+        r = self.session.post(url, data=data, timeout=self.timeout)
+        if r.status_code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+            # Bearer token expired/rejected -> silently re-login once and retry.
+            log.debug("Bearer token expired or rejected, re-authenticating...")
+            try:
+                self._bearer_login()
+                r = self.session.post(url, data=data, timeout=self.timeout)
+            except Exception as e:
+                log.error(f"Bearer re-authentication failed: {e}")
+                return None
+        if r.status_code in BUSY_CODES:
+            self.pwcooldown = time.perf_counter() + 300
+            log.error('Possible Rate limited by Powerwall - Activating 5 minute cooldown')
+            return None
+        if r.status_code != HTTPStatus.OK:
+            log.error(f"Error posting to {url_suffix}: {r.status_code}")
+            return None
+        content = decompress_response(r.content)
+        # Unwrap AuthEnvelope -> bare MessageEnvelope bytes (field 1 = payload).
+        try:
+            auth_resp = combined_pb2.AuthEnvelope()
+            auth_resp.ParseFromString(content)
+            return auth_resp.payload
+        except Exception as e:
+            log.error(f"Error unwrapping auth-envelope response: {e}")
+            return None
+
+    def connect(self, force=False):
+        """Connect to the Powerwall Gateway and retrieve the DIN.
+
+        If a DIN is already known and a session exists, this is a no-op that
+        returns the cached DIN - startup used to reconnect up to 3 times
+        (TEDAPI.__init__, PyPowerwallTEDAPI.__init__ and authenticate()).
+        Pass force=True to tear down the session and reconnect.
+        """
+        if not force and self.din:
+            if self.v1r or getattr(self, 'session', None) is not None:
+                log.debug("Already connected to Powerwall Gateway - skipping reconnect")
+                return self.din
+        # One connect at a time. Concurrent connects each cleared the DIN and
+        # replaced (closing) the session other threads were mid-request on, or
+        # ran N parallel v1r logins; a caller that finds one in flight gets the
+        # current DIN (None if still unknown) instead of starting another.
+        with self._connect_guard:
+            if self._connecting:
+                log.debug("Connect already in progress on another thread - skipping")
+                return self.din
+            self._connecting = True
+        try:
+            return self._connect()
+        finally:
+            with self._connect_guard:
+                self._connecting = False
+
+    def _connect(self):
+        """connect() body; see connect(). Runs on one thread at a time."""
+        if self.v1r:
+            return self._connect_v1r()
+        # Test IP Connection to Powerwall Gateway
+        log.debug(f"Testing Connection to Powerwall Gateway: {self.gw_ip}")
+        url = f'https://{self.gw_ip}'
+        self.din = None
+        # Close any previous session before replacing it - reconnects used to
+        # leak the old session's pooled connections
+        old_session = getattr(self, 'session', None)
+        if old_session is not None:
+            try:
+                old_session.close()
+            except Exception as e:
+                log.debug(f"Error closing previous session: {e}")
+        self.session = self._init_session()
+        try:
+            if self.auth_mode == AuthMode.BEARER:
+                # Bearer mode: log in for a token first (no anonymous web portal
+                # probe — the Authorization header gates every subsequent call).
+                self._bearer_login()
+            else:
+                resp = self.session.get(url, timeout=self.timeout)
+                if resp.status_code != HTTPStatus.OK:
+                    # PW2/+ gateways serve their web portal on GET / (HTTP 200);
+                    # Powerwall 3 has no local web portal and responds with an
+                    # error (403/404 depending on firmware) - any non-200 means
+                    # PW3, EXCEPT transient/retryable codes (429/5xx), which must
+                    # not flip PW3 detection (a busy PW2 is still a PW2), so the
+                    # prior value is kept for those.
+                    if resp.status_code in BUSY_CODES or resp.status_code in RETRY_FORCE_CODES:
+                        log.debug(f"Transient response {resp.status_code} from gateway - "
+                                  f"keeping PW3 detection as {self.pw3}")
+                    else:
+                        log.debug("Detected Powerwall 3 Gateway")
+                        self.pw3 = True
+            self.din = self.get_din()
+        except Exception as e:
+            log.error(f"Unable to connect to Powerwall Gateway {self.gw_ip}")
+            if self.auth_mode == AuthMode.BEARER:
+                log.error("Please verify the gateway password and that the host is reachable.")
+            else:
+                log.error("Please verify your host has a route to the Gateway.")
+            log.error(f"Error Details: {e}")
+        return self.din
+
+    def _connect_v1r(self):
+        """Connect via v1r transport (RSA-signed LAN access). Returns the DIN,
+        or None when the LAN login or DIN fetch fails.
+
+        A known DIN is never cleared: it is the leader's identity, not
+        connection state, and it doesn't change. Keeping it through a failed
+        reconnect (a recovery probe, connect(force=True)) means other threads
+        never see DIN None mid-reconnect (which sent them into a second,
+        concurrent connect() or had the LAN path sign with None), requests
+        keep flowing on whatever transport is live, and the LAN resumes on the
+        first request that succeeds."""
+        log.debug(f"v1r: Connecting to Powerwall Gateway: {self.gw_ip}")
+        din = None
+        self.pw3 = True  # v1r is PW3-only
+        try:
+            if not self.v1r_transport.login():
+                log.error("v1r: Login failed")
+            else:
+                din = self.v1r_transport.get_din()
+                if not din:
+                    log.error("v1r: Failed to get DIN")
+        except Exception as e:
+            log.error(f"v1r: Connection error: {e}")
+        if not din:
+            if not self.din and self._lan_failover_enabled():
+                # First connect with the LAN down: start on the WiFi host
+                return self._v1r_cold_failover()
+            return None
+        self.din = din
+        log.debug(f"v1r: Connected, DIN={self.din}")
+        try:
+            # On successful LAN connect, clear any prior failure state
+            self._lan_reset()
+            # Probe key verification state. Login and DIN both succeed even when the
+            # RSA key is registered but not yet verified (PENDING_VERIFICATION), or
+            # when the wrong key file is being used (UNKNOWN_KEY_ID). A test read
+            # here surfaces the warning at init time instead of silently returning
+            # None on every subsequent data call.
+            probe = self.v1r_transport.get_config_v1r(self.din)
+            if probe:
+                # Seed the config cache with the probe result so the probe is
+                # not a wasted fetch — the first get_config() after connect
+                # will be served from cache.
+                self.pwcache["config"] = probe
+                self.pwcachetime["config"] = time.time()
+            else:
+                from .tedapi_v1r import reregister_hint
+                if self.v1r_transport.pending_verification:
+                    log.error(
+                        "v1r: RSA key is PENDING_VERIFICATION — data calls will return None. "
+                        "Within about 10 minutes of registering, switch the Powerwall 3 On/Off "
+                        "switch OFF for about 15 seconds then ON (or toggle a breaker). "
+                        "A key at state 2 has timed out: re-register the same key with: "
+                        f"{reregister_hint(getattr(self.v1r_transport, 'rsa_key_path', None))}"
+                    )
+                elif self.v1r_transport.key_unknown:
+                    log.error(
+                        "v1r: RSA key not recognized by gateway — data calls will return None. "
+                        "Check that the key file matches the registered key "
+                        f"(fingerprint in use: {getattr(self.v1r_transport, 'key_fingerprint', 'unknown')}). "
+                        "Register or verify the configured key with: "
+                        f"{reregister_hint(getattr(self.v1r_transport, 'rsa_key_path', None))}"
+                    )
+                else:
+                    log.debug("v1r: key probe returned no data (possibly transient) - continuing")
+            # Test WiFi fallback path if configured
+            if self.wifi_session:
+                self._test_wifi_path()
+        except Exception as e:
+            # Past the DIN: the connect succeeded (e.g. the key probe failed)
+            log.error(f"v1r: Connection error: {e}")
+        return self.din
+
+    def _v1r_cold_failover(self):
+        """Start on the WiFi host when the v1r LAN is unreachable at first connect.
+
+        Without this, a container (re)started while the wired LAN is down can
+        never come up: the LAN login fails, connect returns None, and the 3
+        failures needed to trip the regular failover never happen because no
+        data call is ever made. When the WiFi host answers ``/tedapi/din``, its
+        DIN is adopted and failover starts tripped, with the LAN retry where 3
+        consecutive failures would put it (480s). Returns the DIN, or None when
+        the WiFi host doesn't answer either (the connect() contract: DIN or
+        None). Only called when failover is enabled and no DIN is known yet.
+        """
+        din = self._fetch_wifi_din()
+        if not din:
+            return None
+        self.din = din
+        backoff = self._lan_trip_cold()
+        self.wifi_available = True
+        self.wifi_last_success = time.time()
+        log.warning("v1r: LAN unreachable — using WiFi TEDAPI fallback (%s), retry LAN in %.0fs",
+                    self.wifi_host, backoff)
+        return din
+
+    # ── v1r LAN failover state ───────────────────────────────────────────────
+    # Closed (lan_failed False): leader queries go over the LAN, consecutive
+    # failures are counted, and the 3rd trips it. Tripped: leader queries go
+    # via the WiFi host; once lan_recover_after passes, one request claims a
+    # recovery probe (_connect_v1r): success closes it, failure pushes the next
+    # probe out one backoff step. Every transition is one short critical
+    # section under _lan_lock; the reconnect itself runs outside it.
+
+    LAN_TRIP_AFTER = 3  # consecutive LAN failures that trip the failover
+
+    def _lan_failover_enabled(self) -> bool:
+        """Failover applies: v1r, failover on, and a WiFi host to route to.
+        Without a WiFi host there is nowhere to fail over to, so tripping would
+        only return None without trying the LAN (for 8 minutes, even after it
+        came back); every request keeps trying the LAN instead."""
+        return bool(self.v1r and self.failover and self.wifi_session)
+
+    @staticmethod
+    def _lan_backoff(fail_count: int) -> float:
+        """Seconds until the next LAN recovery probe after ``fail_count``
+        consecutive LAN failures: 60 * 2**n, capped at 7680s (~2h)."""
+        return min(60 * (2 ** fail_count), 7680)
+
+    def _lan_record(self, ok: bool) -> None:
+        """Count one LAN request's outcome; the LAN_TRIP_AFTER-th consecutive
+        failure trips the failover (when enabled). Once tripped, the recovery
+        probe owns the state: a request already in flight on the LAN when it
+        tripped doesn't touch it (each late failure would push the first probe
+        out another backoff step)."""
+        tripped = None
+        with self._lan_lock:
+            if self.lan_failed:
+                return
+            if ok:
+                self.lan_fail_count = 0
+                return
+            self.lan_fail_count += 1
+            fail_count = self.lan_fail_count
+            if fail_count >= self.LAN_TRIP_AFTER and self._lan_failover_enabled():
+                tripped = self._lan_trip_locked(fail_count)
+        if tripped is not None:
+            log.warning("v1r: LAN failed %d consecutive times — switching to WiFi TEDAPI fallback"
+                        " (retry LAN in %.0fs)", fail_count, tripped)
+
+    def _lan_trip_cold(self) -> float:
+        """LAN down at first connect: trip where LAN_TRIP_AFTER consecutive
+        failures would. Returns the seconds until the LAN recovery probe."""
+        with self._lan_lock:
+            return self._lan_trip_locked(max(self.lan_fail_count + 1, self.LAN_TRIP_AFTER))
+
+    def _lan_trip_locked(self, fail_count: int) -> float:
+        """Trip (or re-arm) the failover at ``fail_count``; caller holds _lan_lock."""
+        self.lan_failed = True
+        self.lan_fail_count = fail_count
+        backoff = self._lan_backoff(fail_count)
+        self.lan_recover_after = time.time() + backoff
+        return backoff
+
+    def _claim_lan_probe(self) -> bool:
+        """True for exactly one caller once the recovery window opens: the
+        claim pushes the window to where a failed probe would put it, so
+        concurrent callers keep routing via WiFi instead of each reconnecting."""
+        with self._lan_lock:
+            if not self.lan_failed or time.time() < self.lan_recover_after:
+                return False
+            self.lan_recover_after = time.time() + self._lan_backoff(self.lan_fail_count + 1)
+            return True
+
+    def _lan_probe_failed(self) -> float:
+        """The claimed probe failed: one more failure, next probe one backoff
+        step later. Returns the seconds until then."""
+        with self._lan_lock:
+            return self._lan_trip_locked(self.lan_fail_count + 1)
+
+    def _lan_reset(self) -> None:
+        """LAN connected: close the failover and clear the failure count."""
+        with self._lan_lock:
+            self.lan_failed = False
+            self.lan_fail_count = 0
+            self.lan_recover_after = 0
+
+    def close_session(self):
+        """Close the underlying requests.Session objects to the Gateway."""
+        for attr in ('session', 'wifi_session'):
+            s = getattr(self, attr, None)
+            if s is not None:
+                try:
+                    s.close()
+                except Exception as e:
+                    log.debug(f"Error closing {attr}: {e}")
+        v1r_session = getattr(self.v1r_transport, 'session', None) if self.v1r_transport else None
+        if v1r_session is not None:
+            try:
+                v1r_session.close()
+            except Exception as e:
+                log.debug(f"Error closing v1r session: {e}")
+
+    @staticmethod
+    def _import_v2026_pb2():
+        """Import the V2026_06 (Tesla-signed GraphQL) transport + energy_device
+        protobuf modules, raising a clear, actionable error on an old runtime.
+
+        These are the only protobufs in the package built with the latest protoc:
+        their `*_pb2.py` embed a `runtime_version.ValidateProtobufRuntimeVersion()`
+        guard and require protobuf>=6.33.6. The library floor stays at 4.25.1 and
+        the default V2024_06 path never imports these — so this newer requirement
+        (and this error) is only reached when a caller opts into the V2026_06 set."""
+        try:
+            from .protobuf.V2026_06 import tedapi_v2_transport_pb2 as tx
+            from .protobuf.V2026_06 import tedapi_v2_energy_device_pb2 as ed
+            return tx, ed
+        except Exception as e:
+            raise ImportError(
+                'tedapi_api_version="V2026_06" requires protobuf>=6.33.6 — '
+                'pip install -U protobuf'
+            ) from e
+
+    def _build_signed_query_request(self, query, *, recipient_din: Optional[str] = None,
+                                    sender_din: Optional[str] = None, tail: int = 1) -> bytes:
+        """Build a V2026_06 SIGNED GraphQL request: the energy_device
+        MessageEnvelope (graphql.queryRequest, format=SIGNED) wrapped in the
+        v2 transport Message + Tail. `query` is a V2026_06 TEDAPIQuery whose
+        signed_bytes/code carry the Tesla-signed SignedGraphQLQuery + signature.
+
+        Returns full Message bytes (same shape as the legacy path); _post_tedapi
+        extracts the bare envelope for v1r."""
+        tx, ed = self._import_v2026_pb2()
+        pb = tx.Message()
+        pb.message.deliveryChannel = ed.DELIVERY_CHANNEL_LOCAL_HTTPS
+        if sender_din:
+            pb.message.sender.din = sender_din
+        else:
+            pb.message.sender.local = ed.LOCAL_PARTICIPANT_INSTALLER
+        pb.message.recipient.din = recipient_din or self.din
+        gq = pb.message.graphql.queryRequest
+        gq.format = ed.GRAPH_QL_QUERY_FORMAT_SIGNED_SHA256_ECDSA_ASN1
+        gq.query = query.signed_bytes
+        gq.signature = query.code
+        gq.variablesJson.value = query.b_value
+        pb.tail.value = tail
+        return pb.SerializeToString()
+
+    def _parse_signed_query_response(self, response: bytes, from_wifi: bool = False) -> Optional[str]:
+        """Extract the JSON payload from a V2026_06 GraphQLAPIQueryResponse.
+
+        The wire shape depends on the transport, not the mode: only a v1r LAN
+        response is a bare energy_device MessageEnvelope; basic mode AND the v1r
+        WiFi-follower fallback (`_post_tedapi_wifi`) both return a full transport
+        Message with a tail. Callers on the WiFi-follower path must therefore pass
+        `from_wifi=True` even when `self.v1r` is set, otherwise the full Message is
+        misparsed as a bare envelope (protobuf parses it leniently, yielding an
+        empty queryResponse and a silent None). Returns the JSON text, or None.
+
+        TODO: `from_wifi` is a misnomer — the real distinction is full transport
+        Message (with tail) vs. bare MessageEnvelope, not the transport medium.
+        Now that the LAN bearer path also returns a full Message, rename to
+        something like `full_message`/`wrapped` and invert the callers
+        accordingly (condition becomes `full_message or not self.v1r`)."""
+        if not response:
+            return None
+        tx, ed = self._import_v2026_pb2()
+        try:
+            # Bearer transport (and v1r LAN) hands back a bare MessageEnvelope;
+            # basic and the v1r WiFi-follower fallback return a full Message.
+            if (self.v1r and not from_wifi) or self.auth_mode == AuthMode.BEARER:
+                env = ed.MessageEnvelope()
+                env.ParseFromString(response)
+            else:
+                m = tx.Message()
+                m.ParseFromString(response)
+                env = m.message
+        except Exception as e:
+            log.error(f"Error parsing V2026_06 response: {e}")
+            return None
+        resp = env.graphql.queryResponse
+        if resp.errors:
+            log.error("GraphQL errors: %s",
+                      [(er.code, er.message) for er in resp.errors])
+            # A V2026_06 query carries a Tesla-signed SignedGraphQLQuery. If the
+            # gateway rejects every query after a firmware update, Tesla has most
+            # likely rotated the query signing keys and the bundled signatures no
+            # longer validate. Point the user at the legacy fallback so a total
+            # V2026_06 outage is diagnosable rather than a silent empty payload.
+            log.warning(
+                "V2026_06 signed query rejected by the gateway. If this persists "
+                "after a firmware update, Tesla may have rotated the query signing "
+                'keys; fall back with tedapi_api_version="V2024_06" '
+                "(CLI: -tedapi_api_version=V2024_06)."
+            )
+        return resp.data or None
+
+    def _build_request(self, role: QueryRole, *, recipient_din: Optional[str] = None,
+                       sender_din: Optional[str] = None, tail: int = 1) -> bytes:
+        """Build a TEDAPI request for ``role``, dispatching on tedapi_api_version.
+
+        V2026_06 emits a Tesla-signed GraphQL request; every other version emits
+        the legacy QueryType protobuf. Single place the version split lives for the
+        request side — a future june_20xx adds one branch here, not one at every
+        build call site. ``sender_din`` selects follower routing (else local),
+        ``recipient_din`` defaults to this gateway's DIN."""
+        if self.tedapi_api_version == TEDAPIApiVersion.V2026_06:
+            return self._build_signed_query_request(
+                get_query(role, TEDAPIApiVersion.V2026_06),
+                recipient_din=recipient_din, sender_din=sender_din, tail=tail)
+        pb = tedapi_pb2.Message()
+        pb.message.deliveryChannel = 1
+        if sender_din:
+            pb.message.sender.din = sender_din
+        else:
+            pb.message.sender.local = 1
+        pb.message.recipient.din = recipient_din or self.din
+        pb.message.payload.send.num = 2
+        pb.message.payload.send.payload.value = 1
+        apply_query(pb.message.payload.send, get_query(role))
+        pb.tail.value = tail
+        return pb.SerializeToString()
+
+    def _build_config_request(self) -> bytes:
+        """Build the config.json fetch: the legacy ``config.send`` protobuf, on
+        every tedapi_api_version — there is no signed-GraphQL config query (under
+        V2026_06 the same envelope field parses as filestore.readFileRequest).
+        Returns full Message bytes like _build_request; _post_tedapi strips the
+        wrapper for the v1r and bearer transports. Parse the answer with
+        _parse_legacy_response(config=True), not _parse_response."""
+        pb = tedapi_pb2.Message()
+        pb.message.deliveryChannel = 1
+        pb.message.sender.local = 1
+        pb.message.recipient.din = self.din  # DIN of Powerwall
+        pb.message.config.send.num = 1
+        pb.message.config.send.file = "config.json"
+        pb.tail.value = 1
+        return pb.SerializeToString()
+
+    def _parse_response(self, response: bytes, *, from_wifi: bool = False) -> Optional[str]:
+        """Decode a TEDAPI query response to its JSON payload text, dispatching on
+        tedapi_api_version and transport. V2026_06 -> signed GraphQL; otherwise
+        the legacy protobuf (_parse_legacy_response, which takes ``from_wifi``).
+        Always the query payload (``payload.recv.text``): config-file fetches
+        call _parse_legacy_response(config=True) directly. Single place the
+        version+transport split lives for the response side, so the
+        WiFi-fallback context (``from_wifi``) can't be forgotten at a call site
+        (see the transport note on _parse_signed_query_response)."""
+        if self.tedapi_api_version == TEDAPIApiVersion.V2026_06:
+            return self._parse_signed_query_response(response, from_wifi=from_wifi)
+        return self._parse_legacy_response(response, from_wifi=from_wifi)
+
+    def _parse_legacy_response(self, response: bytes, *, from_wifi: bool = False,
+                               config: bool = False) -> Optional[str]:
+        """Decode a legacy-protobuf (V2024_06 wire) response to its text payload,
+        dispatching on transport only: v1r LAN -> v1r query response (a bare
+        envelope; _post_tedapi normalizes its WiFi fallback to the same shape);
+        bearer -> bare MessageEnvelope; basic, and requests sent straight through
+        _post_tedapi_wifi (``from_wifi``) -> full Message with tail. ``config``
+        selects ``config.recv.file.text`` (the config.json fetch) over
+        ``payload.recv.text`` (every query, get_battery_block included).
+
+        Queries reach this through _parse_response's version dispatch. The
+        config.json fetch (get_config) calls it directly: config.send is the same
+        legacy protobuf on every tedapi_api_version, so it must bypass that
+        dispatch — routed through _parse_response, bearer mode (which requires
+        V2026_06) would hand the config response to the signed-GraphQL parser
+        and read back nothing."""
+        if self.v1r and not from_wifi:
+            return self._parse_v1r_query_response(response)
+        if self.auth_mode == AuthMode.BEARER:
+            # Bearer transport already unwrapped the AuthEnvelope to a bare
+            # MessageEnvelope (no outer Message/Tail wrapper).
+            env = tedapi_pb2.MessageEnvelope()
+            env.ParseFromString(response)
+        else:
+            tedapi = tedapi_pb2.Message()
+            tedapi.ParseFromString(response)
+            env = tedapi.message
+        if config:
+            return env.config.recv.file.text
+        return env.payload.recv.text
+
+    def _transport_message(self):
+        """Empty transport ``Message`` (envelope + tail) from the proto set that
+        matches tedapi_api_version. A V2026_06 request carries its graphql
+        payload in envelope field 16, which the legacy proto reinterprets as a
+        QueryType and corrupts on a parse/re-serialize round trip — so every
+        unwrap or re-wrap of a transport Message goes through this, never
+        tedapi_pb2.Message directly. (The legacy config.send fetch survives the
+        V2026_06 proto unchanged: its field 15 parses as filestore.readFileRequest,
+        the same wire shape.)"""
+        if self.tedapi_api_version == TEDAPIApiVersion.V2026_06:
+            _tx, _ = self._import_v2026_pb2()
+            return _tx.Message()
+        return tedapi_pb2.Message()
+
+    def _envelope_bytes(self, pb_bytes: bytes) -> bytes:
+        """Reduce full transport Message bytes (envelope + tail) to the bare
+        MessageEnvelope bytes the v1r and bearer transports send.
+
+        Input that is already a bare envelope is returned unchanged: it has no
+        field-1 Message, and protobuf parses the mismatched wire types leniently
+        into an *empty* ``message`` rather than raising, so an unguarded
+        ``msg.message.SerializeToString()`` would send b"". Unparseable input is
+        passed through too, for the gateway to reject."""
+        # Resolve the proto outside the try so an old-protobuf ImportError is not
+        # masked by the parse fallback (unreachable in practice: a V2026_06
+        # request was already built via the guarded _build_signed_query_request).
+        msg = self._transport_message()
+        try:
+            msg.ParseFromString(pb_bytes)
+        except Exception:
+            return pb_bytes
+        if not msg.HasField('message'):
+            return pb_bytes
+        return msg.message.SerializeToString()
+
+    def _post_tedapi(self, pb_bytes: bytes, din: str = None, url_suffix: str = '/tedapi/v1') -> Optional[bytes]:
+        """
+        Transport abstraction: POST protobuf bytes to the appropriate TEDAPI endpoint.
+
+        WiFi mode:   POST to /tedapi/v1 with HTTP Basic auth session.
+        Bearer mode: Wrap the bare envelope in an AuthEnvelope and POST it with
+                     the Bearer session (see _authenv_post).
+        v1r mode:    Wrap in RSA-signed RoutableMessage and POST to /tedapi/v1r.
+
+        Args:
+            pb_bytes: Serialized protobuf payload: a full tedapi_pb2.Message
+                      (envelope + tail), as every builder emits. v1r and bearer
+                      strip the wrapper here (_envelope_bytes) and also accept
+                      bare MessageEnvelope bytes.
+            din: DIN for v1r envelope (ignored in WiFi mode)
+            url_suffix: URL suffix for WiFi mode (e.g., '/tedapi/v1' or '/tedapi/device/{din}/v1')
+
+        Returns:
+            Raw response content bytes, or None on error.
+            For WiFi: the raw HTTP response body (protobuf)
+            For bearer: bare MessageEnvelope bytes (the AuthEnvelope is unwrapped)
+            For v1r: bare MessageEnvelope bytes — either the inner
+                     protobuf_message_as_bytes from the RoutableMessage response
+                     (LAN), or the envelope re-extracted from the full transport
+                     Message returned by the WiFi fallback. Callers in v1r mode
+                     can always parse the result as a MessageEnvelope regardless
+                     of which transport actually served the request.
+        """
+        if self.v1r:
+            # ── LAN recovery probe ────────────────────────────────────────────
+            # If LAN was marked failed but recovery window has passed, attempt
+            # a reconnect before routing this request over WiFi. Exactly one
+            # thread claims each probe (_claim_lan_probe); the others route via
+            # WiFi while it reconnects (no lock is held across the reconnect).
+            if self.lan_failed and self._claim_lan_probe():
+                log.info("v1r: LAN recovery window reached — attempting reconnect")
+                # Through connect() so the probe is single-flight with any
+                # other connect (e.g. connect(force=True)): a probe failing
+                # after a concurrent connect succeeded would re-trip the
+                # failover with the LAN up. A connect already in flight
+                # returns the current DIN without reconnecting; lan_failed
+                # stays set and this window's probe is skipped.
+                if self.connect(force=True):  # closes the failover on success
+                    if not self.lan_failed:
+                        log.info("v1r: LAN recovered — resuming wired transport")
+                else:
+                    backoff = self._lan_probe_failed()
+                    log.warning("v1r: LAN still unreachable, next retry in %.0fs", backoff)
+
+            # ── LAN failed → full WiFi TEDAPI v1 fallback ────────────────────
+            if self.lan_failed:
+                if not self.wifi_session:
+                    log.error("v1r: LAN down and no WiFi fallback configured")
+                    return None
+                log.debug("v1r: LAN down — routing primary query via WiFi TEDAPI")
+                raw = self._post_tedapi_wifi(pb_bytes, url_suffix)
+                if raw is None:
+                    return None
+                # Normalize to the documented v1r contract: bare MessageEnvelope
+                # bytes. WiFi TEDAPI v1 returns a full transport Message (with
+                # tail); without this re-extract, v1r callers keying their parse
+                # off self.v1r would misparse the wrapper as an envelope —
+                # protobuf decodes it leniently, yielding silently empty data.
+                # Normalizing here (at the transport boundary, where the routing
+                # decision was made) also avoids the race of callers re-checking
+                # self.lan_failed at parse time, which another thread may have
+                # flipped after this request was served over LAN.
+                wifi_msg = self._transport_message()
+                try:
+                    wifi_msg.ParseFromString(raw)
+                    return wifi_msg.message.SerializeToString()
+                except Exception as e:
+                    log.error(f"v1r: Error normalizing WiFi fallback response: {e}")
+                    return None
+
+            # ── Normal v1r LAN path ───────────────────────────────────────────
+            # v1r requires just the MessageEnvelope bytes (NOT the full Message
+            # wrapper with tail). Extract the envelope from the full Message.
+            envelope_bytes = self._envelope_bytes(pb_bytes)
+            # Always sign with leader DIN (self.din) — the RSA key is registered
+            # on the leader only. The follower DIN is in the envelope's recipient
+            # field for routing, but TLV personalization must match the leader.
+            inner = self.v1r_transport.post_v1r(envelope_bytes, self.din)
+            self._lan_record(inner is not None)
+            if inner is not None:
+                self.lan_last_success = time.time()
+            return inner
+        elif self.auth_mode == AuthMode.BEARER:
+            # Bearer, like v1r, sends just the MessageEnvelope: strip the
+            # Message/Tail wrapper here and let _authenv_post wrap the bare
+            # envelope in an AuthEnvelope. It returns the unwrapped bare
+            # MessageEnvelope bytes (parsed by _parse_legacy_response's bearer
+            # branch, like the v1r bare case).
+            return self._authenv_post(self._envelope_bytes(pb_bytes), url_suffix=url_suffix)
+        else:
+            url = f'https://{self.gw_ip}{url_suffix}'
+            r = self.session.post(url, data=pb_bytes, timeout=self.timeout)
+            if r.status_code in BUSY_CODES:
+                self.pwcooldown = time.perf_counter() + 300
+                log.error('Possible Rate limited by Powerwall - Activating 5 minute cooldown')
+                return None
+            if r.status_code != HTTPStatus.OK:
+                log.error(f"Error posting to {url_suffix}: {r.status_code}")
+                return None
+            return decompress_response(r.content)
+
+    def _parse_v1r_query_response(self, inner_bytes: bytes) -> Optional[str]:
+        """
+        Parse v1r query response to extract the JSON text payload.
+
+        For v1r, the response is a MessageEnvelope (not a full Message with tail).
+        The JSON payload is in envelope.payload.recv.text.
+        """
+        if not inner_bytes:
+            return None
+        # v1r returns MessageEnvelope directly (no outer Message wrapper)
+        try:
+            envelope = tedapi_pb2.MessageEnvelope()
+            envelope.ParseFromString(inner_bytes)
+            if envelope.HasField('payload'):
+                return envelope.payload.recv.text
+        except Exception:
+            pass
+        # Fallback: try as full Message
+        try:
+            resp = tedapi_pb2.Message()
+            resp.ParseFromString(inner_bytes)
+            return resp.message.payload.recv.text
+        except Exception:
+            pass
+        # Last resort: find JSON in raw bytes
+        try:
+            text = inner_bytes.decode('utf-8', errors='replace')
+            json_start = text.find('{')
+            if json_start >= 0:
+                depth = 0
+                for i, ch in enumerate(text[json_start:], json_start):
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            return text[json_start:i + 1]
+        except Exception as e:
+            log.error(f"v1r response parse error: {e}")
+        return None
+
+    # Handy Function to access Powerwall Status
+    def current_power(self, location: Optional[str] = None, force: bool = False) -> Optional[Union[float, Dict[str, float]]]:
+        """
+        Get the current power in watts for a specific location or all locations.
+        Args:
+            location: Power location to query. Valid values: BATTERY, SITE, LOAD,
+                    SOLAR, SOLAR_RGM, GENERATOR, CONDUCTOR. Case-insensitive.
+            force: Force refresh of status data
+        Returns:
+            If location specified: Real power in watts (float) or None if not found
+            If no location: Dictionary mapping locations to power values
+        """
+        status = self.get_status(force=force)
+        meter_aggregates = lookup(status, ['control', 'meterAggregates'])
+
+        if not isinstance(meter_aggregates, list):
+            return None
+
+        # Create mapping of location -> power for efficiency
+        power_map = {
+            meter.get('location', '').upper(): meter.get('realPowerW')
+            for meter in meter_aggregates
+            if meter.get('location') is not None
+        }
+
+        if location is None:
+            return power_map
+
+        return power_map.get(location.upper())
+
+
+    def backup_time_remaining(self, force=False):
+        """Get the time remaining in hours."""
+        status = self.get_status(force=force)
+        nominalEnergyRemainingWh = lookup(status, ['control', 'systemStatus', 'nominalEnergyRemainingWh'])
+        load = self.current_power('LOAD', force)
+        if not nominalEnergyRemainingWh or not load:
+            return None
+        time_remaining = nominalEnergyRemainingWh / load
+        return time_remaining
+
+
+    def battery_level(self, force=False):
+        """Get the battery level as a percentage."""
+        status = self.get_status(force=force)
+        nominalEnergyRemainingWh = lookup(status, ['control', 'systemStatus', 'nominalEnergyRemainingWh'])
+        nominalFullPackEnergyWh = lookup(status, ['control', 'systemStatus', 'nominalFullPackEnergyWh'])
+        if not nominalEnergyRemainingWh or not nominalFullPackEnergyWh:
+            log.debug(f"battery_level: Missing battery data - remaining={nominalEnergyRemainingWh}, full={nominalFullPackEnergyWh}")
+            return None
+        battery_level = nominalEnergyRemainingWh / nominalFullPackEnergyWh * 100
+        return battery_level
+
+
+    # Helper Function
+    def extract_fan_speeds(self, data) -> Dict[str, Dict[str, str]]:
+        """Extract fan speed signals from device controller data."""
+        if not isinstance(data, dict):
+            return {}
+
+        fan_speed_signal_names = {"PVAC_Fan_Speed_Actual_RPM", "PVAC_Fan_Speed_Target_RPM"}
+
+        # List to store the valid fan speed values
+        result = {}
+
+        # Iterate over each component in the "msa" list
+        components = data.get("components", {})
+        if isinstance(components, dict):
+            for component in components.get("msa", []):
+                signals = component.get("signals", [])
+                fan_speeds = {
+                    signal["name"]: signal["value"]
+                    for signal in signals
+                    if signal.get("name") in fan_speed_signal_names and signal.get("value") is not None
+                }
+                if not fan_speeds:
+                    continue
+                componentPartNumber = component.get("partNumber")
+                componentSerialNumber = component.get("serialNumber")
+                result[f"PVAC--{componentPartNumber}--{componentSerialNumber}"] = fan_speeds
+        return result
+
+    # Helper Function
+    def extract_pw3_fan_speeds(self, pw3_vitals) -> Dict[str, Dict[str, Optional[float]]]:
+        """Extract Powerwall 3 fan signals from get_pw3_vitals() data.
+
+        Each PW3 inverter has two fans (A and B), delivered on its TEPINV block as
+        PCH_FanSpeed_A/B (measured RPM) and PCH_FanDuty_A/B (drive duty cycle, %).
+        Returns {"TEPINV--<din>": {signal: value, ...}} in get_pw3_vitals() order
+        (leader first, matching /pod), all four signals as delivered (None when
+        unavailable). An inverter with no fan value at all is omitted, so firmware
+        without these signals returns {} exactly as before.
+        """
+        result = {}
+        if not isinstance(pw3_vitals, dict):
+            return result
+        for name, block in pw3_vitals.items():
+            if not name.startswith('TEPINV--') or not isinstance(block, dict):
+                continue
+            fans = {signal: block.get(signal) for signal in PW3_FAN_SIGNAL_NAMES}
+            if any(value is not None for value in fans.values()):
+                result[name] = fans
+        return result
+
+    def get_fan_speeds(self, force=False):
+        """Get the fan speeds for the Powerwall or inverter.
+
+        Powerwall 2/+ fans come from the device controller's PVAC components,
+        keyed "PVAC--<part>--<sn>" (PVAC_Fan_Speed_Actual_RPM / _Target_RPM).
+        Powerwall 3 fans come from each inverter's ComponentsQuery signals, keyed
+        "TEPINV--<din>" like the vitals() block they also appear in (see
+        extract_pw3_fan_speeds). PW3 has no target-RPM signal, so its fans are not
+        reported under the PVAC names.
+
+        PW3 fans need the default V2024_06 query set: they are EXTRA_SIGNAL_NAMES,
+        which the V2026_06 signed PW3Query can't carry, so under V2026_06 the PW3
+        part stays {} (as before). Deliberately not gated on the api version: a
+        future signed query set that delivers the fan signals is reported as is.
+        """
+        fans = self.extract_fan_speeds(self.get_device_controller(force=force))
+        if self.pw3:
+            fans.update(self.extract_pw3_fan_speeds(self.get_pw3_vitals(force=force)))
+        return fans
+
+
+    def derive_meter_config(self, config, types=("neurio_w2_tcp",)) -> dict:
+        """Build a lookup dictionary for meter configuration from config, filtered by meter type(s)."""
+        # Build meter Lookup if available
+        meter_config = {}
+        if not "meters" in config:
+            return meter_config
+        # Loop through each meter and use device_serial as the key
+        for meter in config['meters']:
+            if meter.get('type') not in types:
+                continue
+            device_serial = lookup(meter, ['connection', 'device_serial'])
+            if not device_serial:
+                continue
+            # Check to see if we already have this meter in meter_config
+            if device_serial in meter_config:
+                cts = meter.get('cts', [False] * 4)
+                if not isinstance(cts, list):
+                    cts = [False] * 4
+                for i, ct in enumerate(cts):
+                    if not ct:
+                        continue
+                    meter_config[device_serial]['cts'][i] = True
+                    meter_config[device_serial]['location'][i] = meter.get('location', "")
+            else:
+                # New meter, add to meter_config
+                cts = meter.get('cts', [False] * 4)
+
+                if not isinstance(cts, list):
+                    cts = [False] * 4
+                location = meter.get('location', "")
+                meter_config[device_serial] = {
+                    "type": meter.get('type'),
+                    "location": [location] * 4,
+                    "cts": cts,
+                    "inverted": meter.get('inverted'),
+                    "connection": meter.get('connection'),
+                    "real_power_scale_factor": meter.get('real_power_scale_factor', 1)
+                }
+        return meter_config
+
+
+    def aggregate_neurio_data(self, config_data, status_data, meter_config_data) -> Tuple[dict, dict]:
+        """Aggregate Neurio data from status and config into flat and hierarchical forms."""
+        # Create NEURIO block
+        neurio_flat = {}
+        neurio_hierarchy = {}
+        # Loop through each Neurio device serial number
+        for c, n in enumerate(lookup(status_data, ['neurio', 'readings']) or {}, start=1000):
+            # Loop through each CT on the Neurio device
+            sn = n.get('serial', str(c))
+            cts_flat = {}
+            for i, ct in enumerate(n['dataRead'] or {}):
+                # Only show if we have a meter configuration and cts[i] is true
+                cts_bool = lookup(meter_config_data, [sn, 'cts'])
+                if isinstance(cts_bool, list) and i < len(cts_bool):
+                    if not cts_bool[i]:
+                        # Skip this CT
+                        continue
+                factor = lookup(meter_config_data, [sn, 'real_power_scale_factor']) or 1
+                location = lookup(meter_config_data, [sn, 'location'])
+                ct_hierarchy = {
+                    "Index": i,
+                    "InstRealPower": ct.get('realPowerW', 0) * factor,
+                    "InstReactivePower": ct.get('reactivePowerVAR'),
+                    "InstVoltage": ct.get('voltageV'),
+                    "InstCurrent": ct.get('currentA'),
+                    "Location": location[i] if location and len(location) > i else None
+                }
+                neurio_hierarchy[f"CT{i}"] = ct_hierarchy
+                cts_flat.update({f"NEURIO_CT{i}_" + key: value for key, value in ct_hierarchy.items() if key != "Index"})
+            meter_manufacturer = "NEURIO" if lookup(meter_config_data, [sn, "type"]) == "neurio_w2_tcp" else None
+            rest = {
+                "componentParentDin": lookup(config_data, ['vin']),
+                "firmwareVersion": None,
+                "lastCommunicationTime": lookup(n, ['timestamp']),
+                "manufacturer": meter_manufacturer,
+                "meterAttributes": {
+                    "meterLocation": []
+                },
+                "serialNumber": sn
+            }
+            neurio_flat[f"NEURIO--{sn}"] = {**cts_flat, **rest}
+        return (neurio_flat, neurio_hierarchy)
+
+    def aggregate_remote_meter_data(self, config_data, status_data, meter_config_data) -> Tuple[dict, dict]:
+        """Aggregate Tesla Remote Meter (teslaRemoteMeter) data from status and config into flat and hierarchical forms.
+
+        The hierarchy is keyed by "{din}:{ct index}" (not just the CT slot) so a
+        second remote meter doesn't overwrite the first - the full query supports
+        multiple meters. Each entry still carries its own "Index" (the CT's
+        original 0-based slot in that meter), so callers that need to map a CT
+        back to a specific phase (i_a/i_b/i_c) use that instead of iteration
+        order, which would silently misassign phases whenever a CT slot is
+        skipped (e.g. cts=[True, False, True, False])."""
+        remote_flat = {}
+        remote_hierarchy = {}
+        # Loop through each remote meter device (keyed by din)
+        for m in lookup(status_data, ['teslaRemoteMeter', 'meters']) or []:
+            din = m.get('din')
+            if not din:
+                continue
+            reading = m.get('reading') or {}
+            cts_flat = {}
+            for i, ct in enumerate(reading.get('ctReadings') or []):
+                # Only show if we have a meter configuration and cts[i] is true
+                cts_bool = lookup(meter_config_data, [din, 'cts'])
+                if isinstance(cts_bool, list) and i < len(cts_bool):
+                    if not cts_bool[i]:
+                        # Skip this CT
+                        continue
+                factor = lookup(meter_config_data, [din, 'real_power_scale_factor']) or 1
+                location = lookup(meter_config_data, [din, 'location'])
+                ct_hierarchy = {
+                    "Index": i,
+                    "InstRealPower": (ct.get('realPowerW') or 0) * factor,
+                    "InstReactivePower": ct.get('reactivePowerVAR'),
+                    "InstVoltage": ct.get('voltageV'),
+                    "InstCurrent": ct.get('currentA'),
+                    "EnergyExportedWs": ct.get('energyExportedWs'),
+                    "EnergyImportedWs": ct.get('energyImportedWs'),
+                    "Location": location[i] if location and len(location) > i else None
+                }
+                remote_hierarchy[f"{din}:{i}"] = ct_hierarchy
+                cts_flat.update({f"TRM_CT{i}_" + key: value for key, value in ct_hierarchy.items() if key != "Index"})
+            rest = {
+                "componentParentDin": lookup(config_data, ['vin']),
+                "firmwareVersion": reading.get('firmwareVersion'),
+                "lastCommunicationTime": reading.get('timestamp'),
+                "manufacturer": "TESLA" if lookup(meter_config_data, [din, "type"]) else None,
+                "meterAttributes": {
+                    "meterLocation": []
+                },
+                "serialNumber": din
+            }
+            remote_flat[f"TRM--{din}"] = {**cts_flat, **rest}
+        return (remote_flat, remote_hierarchy)
+
+    def get_remote_meter_readings(self, config=None, force=False) -> dict:
+        """
+        Fetch and aggregate Tesla Remote Meter (teslaRemoteMeter) CT readings, keyed by CT slot.
+
+        Remote meter data is only present in the Device Controller Full query
+        (get_device_controller()), not the basic status query used by get_status(), so this
+        issues its own (cached) fetch - but only when config.json actually declares a remote
+        meter (type "trm_mb"). Most installs have none, so callers that already have `config`
+        (the site/solar aggregate extractors) should pass it in: it lets this skip the extra
+        Full-query fetch entirely instead of paying for one on every poll for every user.
+        """
+        if config is None:
+            config = self.get_config(force=force)
+        if not isinstance(config, dict):
+            return {}
+        meter_config = self.derive_meter_config(config, types=("trm_mb",))
+        if not meter_config:
+            return {}
+        controller = self.get_device_controller(force=force)
+        if not isinstance(controller, dict):
+            return {}
+        return self.aggregate_remote_meter_data(config, controller, meter_config)[1]
+
+    # Vitals API Mapping Function
+    def vitals(self, force=False):
+        """Create a vitals API dictionary using TEDAPI data."""
+        def calculate_ac_power(Vpeak, Ipeak):
+            Vrms = Vpeak / math.sqrt(2)
+            Irms = Ipeak / math.sqrt(2)
+            power = Vrms * Irms
+            return power
+
+        def calculate_dc_power(V, I):
+            power = V * I
+            return power
+
+        # status = self.get_status(force)
+        config = self.get_config(force=force)
+        status = self.get_device_controller(force=force)
+
+        if not isinstance(status, dict) or not isinstance(config, dict):
+            return None
+
+        # Create Header
+        tesla = {}
+        header = {}
+        header["VITALS"] = {
+            "text": "Device vitals generated from Tesla Powerwall Gateway TEDAPI",
+            "timestamp": time.time(),
+            "gateway": self.gw_ip,
+            "pyPowerwall": __version__,
+        }
+        neurio = self.aggregate_neurio_data(
+            config_data=config,
+            status_data=status,
+            meter_config_data=self.derive_meter_config(config)
+        )[0]
+        remote_meter = self.aggregate_remote_meter_data(
+            config_data=config,
+            status_data=status,
+            meter_config_data=self.derive_meter_config(config, types=("trm_mb",))
+        )[0]
+
+        # Create PVAC, PVS, and TESLA blocks - Assume the are aligned
+        pvac = {}
+        pvs = {}
+        tesla = {}
+        num = len(lookup(status, ['esCan', 'bus', 'PVAC']) or {})
+        if num != len(lookup(status, ['esCan', 'bus', 'PVS']) or {}):
+            log.debug("PVAC and PVS device count mismatch in TEDAPI")
+        # Loop through each device serial number
+        fan_speeds = self.extract_fan_speeds(status)
+        for i, p in enumerate(lookup(status, ['esCan', 'bus', 'PVAC']) or {}):
+            if not p['packageSerialNumber']:
+                continue
+            packagePartNumber = p.get('packagePartNumber', str(i))
+            packageSerialNumber = p.get('packageSerialNumber', str(i))
+            pvac_name = f"PVAC--{packagePartNumber}--{packageSerialNumber}"
+            pvac_logging = p['PVAC_Logging']
+            V_A = pvac_logging['PVAC_PVMeasuredVoltage_A']
+            V_B = pvac_logging['PVAC_PVMeasuredVoltage_B']
+            V_C = pvac_logging['PVAC_PVMeasuredVoltage_C']
+            V_D = pvac_logging['PVAC_PVMeasuredVoltage_D']
+            I_A = pvac_logging['PVAC_PVCurrent_A']
+            I_B = pvac_logging['PVAC_PVCurrent_B']
+            I_C = pvac_logging['PVAC_PVCurrent_C']
+            I_D = pvac_logging['PVAC_PVCurrent_D']
+            P_A = calculate_dc_power(V_A, I_A)
+            P_B = calculate_dc_power(V_B, I_B)
+            P_C = calculate_dc_power(V_C, I_C)
+            P_D = calculate_dc_power(V_D, I_D)
+            pvac[pvac_name] = {
+                "PVAC_Fout": lookup(p, ['PVAC_Status', 'PVAC_Fout']),
+                "PVAC_GridState": None,
+                "PVAC_InvState": None,
+                "PVAC_Iout": None,
+                "PVAC_LifetimeEnergyPV_Total": None,
+                "PVAC_PVCurrent_A": I_A,
+                "PVAC_PVCurrent_B": I_B,
+                "PVAC_PVCurrent_C": I_C,
+                "PVAC_PVCurrent_D": I_D,
+                "PVAC_PVMeasuredPower_A": P_A, # computed
+                "PVAC_PVMeasuredPower_B": P_B, # computed
+                "PVAC_PVMeasuredPower_C": P_C, # computed
+                "PVAC_PVMeasuredPower_D": P_D, # computed
+                "PVAC_PVMeasuredVoltage_A": V_A,
+                "PVAC_PVMeasuredVoltage_B": V_B,
+                "PVAC_PVMeasuredVoltage_C": V_C,
+                "PVAC_PVMeasuredVoltage_D": V_D,
+                "PVAC_Pout": lookup(p, ['PVAC_Status', 'PVAC_Pout']),
+                "PVAC_PvState_A": None, # These are placeholders
+                "PVAC_PvState_B": None, # Compute from PVS below
+                "PVAC_PvState_C": None, # PV_Disabled, PV_Active, PV_Active_Parallel
+                "PVAC_PvState_D": None, # Not available in TEDAPI
+                "PVAC_Qout": None,
+                "PVAC_State": lookup(p, ['PVAC_Status', 'PVAC_State']),
+                "PVAC_VHvMinusChassisDC": None,
+                "PVAC_VL1Ground": lookup(p, ['PVAC_Logging', 'PVAC_VL1Ground']),
+                "PVAC_VL2Ground": lookup(p, ['PVAC_Logging', 'PVAC_VL2Ground']),
+                "PVAC_Vout": lookup(p, ['PVAC_Status', 'PVAC_Vout']),
+                "alerts": lookup(p, ['alerts', 'active']) or [],
+                "PVI-PowerStatusSetpoint": None,
+                "componentParentDin": None, # TODO: map to TETHC
+                "firmwareVersion": None,
+                "lastCommunicationTime": None,
+                "manufacturer": "TESLA",
+                "partNumber": packagePartNumber,
+                "serialNumber": packageSerialNumber,
+                "teslaEnergyEcuAttributes": {
+                    "ecuType": 296
+                }
+            }
+            pvac_fans = fan_speeds.get(pvac_name, {})
+            if pvac_fans:
+                pvac[pvac_name].update({
+                    "PVAC_Fan_Speed_Actual_RPM": pvac_fans["PVAC_Fan_Speed_Actual_RPM"],
+                    "PVAC_Fan_Speed_Target_RPM": pvac_fans["PVAC_Fan_Speed_Target_RPM"]
+                })
+
+            pvs_name = f"PVS--{packagePartNumber}--{packageSerialNumber}"
+            pvs_data = lookup(status, ['esCan', 'bus', 'PVS'])
+            if i < len(pvs_data):
+                pvs_data = pvs_data[i]
+                # Set String Connected states
+                string_a = lookup(pvs_data, ['PVS_Status', 'PVS_StringA_Connected'])
+                string_b = lookup(pvs_data, ['PVS_Status', 'PVS_StringB_Connected'])
+                string_c = lookup(pvs_data, ['PVS_Status', 'PVS_StringC_Connected'])
+                string_d = lookup(pvs_data, ['PVS_Status', 'PVS_StringD_Connected'])
+                # Set PVAC PvState based on PVS String Connected states
+                pvac[pvac_name]["PVAC_PvState_A"] = "PV_Active" if string_a else "PV_Disabled"
+                pvac[pvac_name]["PVAC_PvState_B"] = "PV_Active" if string_b else "PV_Disabled"
+                pvac[pvac_name]["PVAC_PvState_C"] = "PV_Active" if string_c else "PV_Disabled"
+                pvac[pvac_name]["PVAC_PvState_D"] = "PV_Active" if string_d else "PV_Disabled"
+                pvs[pvs_name] = {
+                    "PVS_EnableOutput": None,
+                    "PVS_SelfTestState": lookup(pvs_data, ['PVS_Status', 'PVS_SelfTestState']),
+                    "PVS_State": lookup(pvs_data, ['PVS_Status', 'PVS_State']),
+                    "PVS_StringA_Connected": string_a,
+                    "PVS_StringB_Connected": string_b,
+                    "PVS_StringC_Connected": string_c,
+                    "PVS_StringD_Connected": string_d,
+                    "PVS_vLL": lookup(pvs_data, ['PVS_Status', 'PVS_vLL']),
+                    "alerts": lookup(pvs_data, ['alerts', 'active']) or [],
+                    "componentParentDin": pvac_name,
+                    "firmwareVersion": None,
+                    "lastCommunicationTime": None,
+                    "manufacturer": "TESLA",
+                    "partNumber": packagePartNumber,
+                    "serialNumber": packageSerialNumber,
+                    "teslaEnergyEcuAttributes": {
+                        "ecuType": 297
+                    }
+                }
+            tesla_name = f"TESLA--{packagePartNumber}--{packageSerialNumber}"
+            if "solars" in config and i < len(config.get('solars', [{}])):
+                tesla_nameplate = config['solars'][i].get('power_rating_watts', None)
+                brand = config['solars'][i].get('brand', None)
+            else:
+                tesla_nameplate = None
+                brand = None
+            tesla[tesla_name] = {
+                "componentParentDin": f"STSTSM--{lookup(config, ['vin'])}",
+                "firmwareVersion": None,
+                "lastCommunicationTime": None,
+                "manufacturer": brand.upper() if brand else "TESLA",
+                "pvInverterAttributes": {
+                    "nameplateRealPowerW": tesla_nameplate,
+                },
+                "serialNumber": f"{packagePartNumber}--{packageSerialNumber}",
+            }
+
+        # Create STSTSM block
+        name = f"STSTSM--{lookup(config, ['vin'])}"
+        ststsm = {}
+        ststsm[name] =  {
+            "STSTSM-Location": "Gateway",
+            "alerts": lookup(status, ['control', 'alerts', 'active']) or [],
+            "firmwareVersion": None,
+            "lastCommunicationTime": None,
+            "manufacturer": "TESLA",
+            "partNumber": lookup(config, ['vin']).split('--')[0],
+            "serialNumber": lookup(config, ['vin']).split('--')[-1],
+            "teslaEnergyEcuAttributes": {
+                "ecuType": 207
+            }
+        }
+
+        # Get Dictionary of Powerwall Temperatures
+        temp_sensors = {}
+        for i in lookup(status, ['components', 'msa']) or []:
+            if "signals" in i and "serialNumber" in i and i["serialNumber"]:
+                for s in i["signals"]:
+                    if "name" in s and s["name"] == "THC_AmbientTemp" and "value" in s:
+                        temp_sensors[i["serialNumber"]] = s["value"]
+
+        # Create TETHC, TEPINV and TEPOD blocks
+        tethc = {} # parent
+        tepinv = {}
+        tepod = {}
+        # Loop through each THC device serial number
+        for i, p in enumerate(lookup(status, ['esCan', 'bus', 'THC']) or {}):
+            if not p['packageSerialNumber']:
+                continue
+            packagePartNumber = p.get('packagePartNumber', str(i))
+            packageSerialNumber = p.get('packageSerialNumber', str(i))
+            # TETHC block
+            parent_name = f"TETHC--{packagePartNumber}--{packageSerialNumber}"
+            tethc[parent_name] = {
+                "THC_AmbientTemp": temp_sensors.get(packageSerialNumber, None),
+                "THC_State": None,
+                "alerts": lookup(p, ['alerts', 'active']) or [],
+                "componentParentDin": f"STSTSM--{lookup(config, ['vin'])}",
+                "firmwareVersion": None,
+                "lastCommunicationTime": None,
+                "manufacturer": "TESLA",
+                "partNumber": packagePartNumber,
+                "serialNumber": packageSerialNumber,
+                "teslaEnergyEcuAttributes": {
+                    "ecuType": 224
+                }
+            }
+            # TEPOD block
+            name = f"TEPOD--{packagePartNumber}--{packageSerialNumber}"
+            # POD list can be missing or shorter than the THC list - default to {}
+            pod_data = lookup(status, ['esCan', 'bus', 'POD']) or []
+            pod = pod_data[i] if i < len(pod_data) else {}
+            energy_remaining = lookup(pod, ['POD_EnergyStatus', 'POD_nom_energy_remaining'])
+            full_pack_energy = lookup(pod, ['POD_EnergyStatus', 'POD_nom_full_pack_energy'])
+            if energy_remaining and full_pack_energy:
+                energy_to_be_charged = full_pack_energy - energy_remaining
+            else:
+                energy_to_be_charged = None
+            tepod[name] = {
+                "POD_ActiveHeating": None,
+                "POD_CCVhold": None,
+                "POD_ChargeComplete": None,
+                "POD_ChargeRequest": None,
+                "POD_DischargeComplete": None,
+                "POD_PermanentlyFaulted": None,
+                "POD_PersistentlyFaulted": None,
+                "POD_available_charge_power": None,
+                "POD_available_dischg_power": None,
+                "POD_enable_line": None,
+                "POD_nom_energy_remaining": energy_remaining,
+                "POD_nom_energy_to_be_charged": energy_to_be_charged, #computed
+                "POD_nom_full_pack_energy": full_pack_energy,
+                "POD_state": None,
+                "alerts": lookup(p, ['alerts', 'active']) or [],
+                "componentParentDin": parent_name,
+                "firmwareVersion": None,
+                "lastCommunicationTime": None,
+                "manufacturer": "TESLA",
+                "partNumber": packagePartNumber,
+                "serialNumber": packageSerialNumber,
+                "teslaEnergyEcuAttributes": {
+                    "ecuType": 226
+                }
+            }
+            # TEPINV block
+            name = f"TEPINV--{packagePartNumber}--{packageSerialNumber}"
+            # PINV list can be missing or shorter than the THC list - default to {}
+            pinv_data = lookup(status, ['esCan', 'bus', 'PINV']) or []
+            pinv = pinv_data[i] if i < len(pinv_data) else {}
+            tepinv[name] = {
+                "PINV_EnergyCharged": None,
+                "PINV_EnergyDischarged": None,
+                "PINV_Fout": lookup(pinv, ['PINV_Status', 'PINV_Fout']),
+                "PINV_GridState": lookup(pinv, ['PINV_Status', 'PINV_GridState']),
+                "PINV_HardwareEnableLine": None,
+                "PINV_PllFrequency": None,
+                "PINV_PllLocked": None,
+                "PINV_Pnom": lookup(pinv, ['PINV_PowerCapability', 'PINV_Pnom']),
+                "PINV_Pout": lookup(pinv, ['PINV_Status', 'PINV_Pout']),
+                "PINV_PowerLimiter": None,
+                "PINV_Qout": None,
+                "PINV_ReadyForGridForming": None,
+                "PINV_State": lookup(pinv, ['PINV_Status', 'PINV_State']),
+                "PINV_VSplit1": lookup(pinv, ['PINV_AcMeasurements', 'PINV_VSplit1']),
+                "PINV_VSplit2": lookup(pinv, ['PINV_AcMeasurements', 'PINV_VSplit2']),
+                "PINV_Vout": lookup(pinv, ['PINV_Status', 'PINV_Vout']),
+                "alerts": lookup(pinv, ['alerts', 'active']) or [],
+                "componentParentDin": parent_name,
+                "firmwareVersion": None,
+                "lastCommunicationTime": None,
+                "manufacturer": "TESLA",
+                "partNumber": packagePartNumber,
+                "serialNumber": packageSerialNumber,
+                "teslaEnergyEcuAttributes": {
+                    "ecuType": 253
+                }
+            }
+
+        # Create TESYNC block
+        tesync = {}
+        sync = lookup(status, ['esCan', 'bus', 'SYNC']) or {}
+        islander = lookup(status, ['esCan', 'bus', 'ISLANDER']) or {}
+        packagePartNumber = sync.get('packagePartNumber', None)
+        packageSerialNumber = sync.get('packageSerialNumber', None)
+        # NOTE: these blocks are emitted even when the SYNC bus is absent and
+        # the serial is None (typical PW3, yielding "TESYNC--None--None" /
+        # "TESLA--None" names) - the TESLA block's componentParentDin
+        # (STSTSM--<vin>) is the only place the gateway DIN/serial appears in
+        # TEDAPI vitals and consumers depend on it. Frozen behavior - do not
+        # guard these blocks on the serial number.
+        name = f"TESYNC--{packagePartNumber}--{packageSerialNumber}"
+        tesync[name] = {
+            "ISLAND_FreqL1_Load": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_FreqL1_Load']),
+            "ISLAND_FreqL1_Main": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_FreqL1_Main']),
+            "ISLAND_FreqL2_Load": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_FreqL2_Load']),
+            "ISLAND_FreqL2_Main": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_FreqL2_Main']),
+            "ISLAND_FreqL3_Load": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_FreqL3_Load']),
+            "ISLAND_FreqL3_Main": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_FreqL3_Main']),
+            "ISLAND_GridConnected": lookup(islander, ['ISLAND_GridConnection', 'ISLAND_GridConnected']),
+            "ISLAND_GridState": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_GridState']),
+            "ISLAND_L1L2PhaseDelta":lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_L1L2PhaseDelta']),
+            "ISLAND_L1L3PhaseDelta": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_L1L3PhaseDelta']),
+            "ISLAND_L1MicrogridOk": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_L1MicrogridOk']),
+            "ISLAND_L2L3PhaseDelta": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_L2L3PhaseDelta']),
+            "ISLAND_L2MicrogridOk": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_L2MicrogridOk']),
+            "ISLAND_L3MicrogridOk": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_L3MicrogridOk']),
+            "ISLAND_PhaseL1_Main_Load": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_PhaseL1_Main_Load']),
+            "ISLAND_PhaseL2_Main_Load": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_PhaseL2_Main_Load']),
+            "ISLAND_PhaseL3_Main_Load": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_PhaseL3_Main_Load']),
+            "ISLAND_ReadyForSynchronization": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_ReadyForSynchronization']),
+            "ISLAND_VL1N_Load": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_VL1N_Load']),
+            "ISLAND_VL1N_Main": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_VL1N_Main']),
+            "ISLAND_VL2N_Load": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_VL2N_Load']),
+            "ISLAND_VL2N_Main": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_VL2N_Main']),
+            "ISLAND_VL3N_Load": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_VL3N_Load']),
+            "ISLAND_VL3N_Main": lookup(islander, ['ISLAND_AcMeasurements', 'ISLAND_VL3N_Main']),
+            "METER_X_CTA_I": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_CTA_I']),
+            "METER_X_CTA_InstReactivePower": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_CTA_InstReactivePower']),
+            "METER_X_CTA_InstRealPower": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_CTA_InstRealPower']),
+            "METER_X_CTB_I": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_CTB_I']),
+            "METER_X_CTB_InstReactivePower": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_CTB_InstReactivePower']),
+            "METER_X_CTB_InstRealPower": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_CTB_InstRealPower']),
+            "METER_X_CTC_I": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_CTC_I']),
+            "METER_X_CTC_InstReactivePower": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_CTC_InstReactivePower']),
+            "METER_X_CTC_InstRealPower": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_CTC_InstRealPower']),
+            "METER_X_LifetimeEnergyExport": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_LifetimeEnergyExport']),
+            "METER_X_LifetimeEnergyImport": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_LifetimeEnergyImport']),
+            "METER_X_VL1N": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_VL1N']),
+            "METER_X_VL2N": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_VL2N']),
+            "METER_X_VL3N": lookup(sync, ['METER_X_AcMeasurements', 'METER_X_VL3N']),
+            "METER_Y_CTA_I": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_CTA_I']),
+            "METER_Y_CTA_InstReactivePower": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_CTA_InstReactivePower']),
+            "METER_Y_CTA_InstRealPower": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_CTA_InstRealPower']),
+            "METER_Y_CTB_I": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_CTB_I']),
+            "METER_Y_CTB_InstReactivePower": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_CTB_InstReactivePower']),
+            "METER_Y_CTB_InstRealPower": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_CTB_InstRealPower']),
+            "METER_Y_CTC_I": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_CTC_I']),
+            "METER_Y_CTC_InstReactivePower": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_CTC_InstReactivePower']),
+            "METER_Y_CTC_InstRealPower": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_CTC_InstRealPower']),
+            "METER_Y_LifetimeEnergyExport": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_LifetimeEnergyExport']),
+            "METER_Y_LifetimeEnergyImport": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_LifetimeEnergyImport']),
+            "METER_Y_VL1N": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_VL1N']),
+            "METER_Y_VL2N": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_VL2N']),
+            "METER_Y_VL3N": lookup(sync, ['METER_Y_AcMeasurements', 'METER_Y_VL3N']),
+            "SYNC_ExternallyPowered": None,
+            "SYNC_SiteSwitchEnabled": None,
+            "alerts": lookup(sync, ['alerts', 'active']) or [],
+            "componentParentDin": f"STSTSM--{lookup(config, ['vin'])}",
+            "firmwareVersion": None,
+            "manufacturer": "TESLA",
+            "partNumber": packagePartNumber,
+            "serialNumber": packageSerialNumber,
+            "teslaEnergyEcuAttributes": {
+                "ecuType": 259
+            }
+        }
+
+        # Create TEMSA block - Backup Switch
+        temsa = {}
+        msa = lookup(status, ['esCan', 'bus', 'MSA']) or {}
+        packagePartNumber = msa.get('packagePartNumber', None)
+        packageSerialNumber = msa.get('packageSerialNumber', None)
+
+        # For Powerwall 3, MSA data comes from components.msa with signals format
+        if not packageSerialNumber:
+            for component in lookup(status, ['components', 'msa']) or []:
+                if component.get('serialNumber') and any(
+                    s.get('name', '').startswith('METER_Z') for s in component.get('signals', [])
+                ):
+                    packagePartNumber = component.get('partNumber')
+                    packageSerialNumber = component.get('serialNumber')
+                    # Convert signals array to dict keyed by name
+                    signals_dict = {s['name']: s.get('value') for s in component.get('signals', []) if 'name' in s}
+                    # Create a fake METER_Z_AcMeasurements structure for compatibility
+                    # PW3 uses VL1G/VL2G (ground-ref), map to VL1N/VL2N for consistency
+                    msa = {
+                        'packagePartNumber': packagePartNumber,
+                        'packageSerialNumber': packageSerialNumber,
+                        'METER_Z_AcMeasurements': {
+                            'METER_Z_CTA_I': signals_dict.get('METER_Z_CTA_I'),
+                            'METER_Z_CTA_InstReactivePower': signals_dict.get('METER_Z_CTA_InstReactivePower'),
+                            'METER_Z_CTA_InstRealPower': signals_dict.get('METER_Z_CTA_InstRealPower'),
+                            'METER_Z_CTB_I': signals_dict.get('METER_Z_CTB_I'),
+                            'METER_Z_CTB_InstReactivePower': signals_dict.get('METER_Z_CTB_InstReactivePower'),
+                            'METER_Z_CTB_InstRealPower': signals_dict.get('METER_Z_CTB_InstRealPower'),
+                            'METER_Z_CTC_I': signals_dict.get('METER_Z_CTC_I'),
+                            'METER_Z_CTC_InstReactivePower': signals_dict.get('METER_Z_CTC_InstReactivePower'),
+                            'METER_Z_CTC_InstRealPower': signals_dict.get('METER_Z_CTC_InstRealPower'),
+                            'METER_Z_VL1N': signals_dict.get('METER_Z_VL1G'),
+                            'METER_Z_VL2N': signals_dict.get('METER_Z_VL2G'),
+                            'METER_Z_VL3N': signals_dict.get('METER_Z_VL3G'),
+                            'METER_Z_LifetimeEnergyExport': signals_dict.get('METER_Z_LifetimeEnergyExport'),
+                            'METER_Z_LifetimeEnergyImport': signals_dict.get('METER_Z_LifetimeEnergyImport'),
+                        }
+                    }
+                    break
+
+        if packageSerialNumber:
+            name = f"TEMSA--{packagePartNumber}--{packageSerialNumber}"
+            temsa[name] = {
+                "METER_Z_CTA_I": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_CTA_I']),
+                "METER_Z_CTA_InstReactivePower": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_CTA_InstReactivePower']),
+                "METER_Z_CTA_InstRealPower": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_CTA_InstRealPower']),
+                "METER_Z_CTB_I": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_CTB_I']),
+                "METER_Z_CTB_InstReactivePower": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_CTB_InstReactivePower']),
+                "METER_Z_CTB_InstRealPower": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_CTB_InstRealPower']),
+                "METER_Z_CTC_I": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_CTC_I']),
+                "METER_Z_CTC_InstReactivePower": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_CTC_InstReactivePower']),
+                "METER_Z_CTC_InstRealPower": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_CTC_InstRealPower']),
+                "METER_Z_LifetimeEnergyExport": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_LifetimeEnergyExport']),
+                "METER_Z_LifetimeEnergyImport": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_LifetimeEnergyImport']),
+                "METER_Z_VL1N": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_VL1N']),
+                "METER_Z_VL2N": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_VL2N']),
+                "METER_Z_VL3N": lookup(msa, ['METER_Z_AcMeasurements', 'METER_Z_VL3N']),
+                "alerts": lookup(msa, ['alerts', 'active']) or [],
+                "componentParentDin": f"STSTSM--{lookup(config, ['vin'])}",
+                "firmwareVersion": None,
+                "manufacturer": "TESLA",
+                "partNumber": packagePartNumber,
+                "serialNumber": packageSerialNumber,
+                "teslaEnergyEcuAttributes": {
+                    "ecuType": 300
+                }
+            }
+
+        # Create TESLA block - tied to TESYNC
+        name = f"TESLA--{packageSerialNumber}"
+        tesla[name] = {
+                "componentParentDin": f"STSTSM--{lookup(config, ['vin'])}",
+                "lastCommunicationTime": None,
+                "manufacturer": "TESLA",
+                "meterAttributes": {
+                    "meterLocation": [
+                        1
+                    ]
+                },
+                "serialNumber": packageSerialNumber
+            }
+
+        # Create Vitals Dictionary
+        vitals = {
+            **header,
+            **neurio,
+            **remote_meter,
+            **pvac,
+            **pvs,
+            **ststsm,
+            **tepinv,
+            **tepod,
+            **tesla,
+            **tesync,
+            **tethc,
+            **temsa,
+        }
+        # Merge in the Powerwall 3 data if available
+        if self.pw3:
+            pw3_data = self.get_pw3_vitals(force) or {}
+            vitals.update(pw3_data)
+
+        return vitals
+
+
+    def get_blocks(self, force=False):
+        """
+        Get the list of battery blocks from the Powerwall Gateway.
+
+        This includes both regular Powerwall units (with inverters) and battery
+        expansion packs (battery-only units without inverters).
+        """
+        vitals = self.vitals(force=force)
+        if not isinstance(vitals, dict):
+            return None
+        block = {}
+
+        # Walk through the vitals dictionary and create blocks for Powerwall units with inverters
+        for key, _ in vitals.items():
+            if key.startswith("TEPINV--"):
+                # Extract the part and serial numbers from the key
+                parts = key.split("--")
+                if len(parts) < 3:
+                    continue
+                packagePartNumber = parts[1]
+                packageSerialNumber = parts[2]
+                name = f"{packagePartNumber}--{packageSerialNumber}"
+                # Extract key information from TEPINV
+                f_out = lookup(vitals, [key, 'PINV_Fout'])
+                pinv_state = lookup(vitals, [key, 'PINV_State'])
+                pinv_grid_state = lookup(vitals, [key, 'PINV_GridState'])
+                p_out = lookup(vitals, [key, 'PINV_Pout'])
+                v_out = lookup(vitals, [key, 'PINV_Vout'])
+                block[name] = {
+                    "Type": "",
+                    "PackagePartNumber": packagePartNumber,
+                    "PackageSerialNumber": packageSerialNumber,
+                    "disabled_reasons": [],
+                    "pinv_state": pinv_state,
+                    "pinv_grid_state": pinv_grid_state,
+                    "nominal_energy_remaining": None,
+                    "nominal_full_pack_energy": None,
+                    "p_out": p_out,
+                    "q_out": None,
+                    "v_out": v_out,
+                    "f_out": f_out,
+                    "i_out": None,
+                    "energy_charged": None,
+                    "energy_discharged": None,
+                    "off_grid": None,
+                    "vf_mode": None,
+                    "wobble_detected": None,
+                    "charge_power_clamped": None,
+                    "backup_ready": None,
+                    "OpSeqState": None,
+                    "version": None
+                }
+                # See if there is a TEPOD block for this TEPINV
+                tepod_key = f"TEPOD--{packagePartNumber}--{packageSerialNumber}"
+                if tepod_key in vitals:
+                    nominal_energy_remaining = lookup(vitals, [tepod_key, 'POD_nom_energy_remaining'])
+                    nominal_full_pack_energy = lookup(vitals, [tepod_key, 'POD_nom_full_pack_energy'])
+                    block[name].update({
+                        "nominal_energy_remaining": nominal_energy_remaining,
+                        "nominal_full_pack_energy": nominal_full_pack_energy,
+                    })
+
+        # Add battery expansion packs (battery-only units without inverters)
+        # Expansion pack energy is now included in vitals() as TEPOD entries
+        config = self.get_config(force=force)
+        if config and 'battery_blocks' in config:
+            for battery in config['battery_blocks']:
+                if 'battery_expansions' in battery and battery['battery_expansions']:
+                    for expansion in battery['battery_expansions']:
+                        exp_din = expansion.get('din')
+                        if not exp_din:
+                            continue
+
+                        # Extract part and serial from DIN (format: "1807000-10-B--TG125035000A5E")
+                        exp_parts = exp_din.split('--')
+                        if len(exp_parts) < 2:
+                            log.debug(f"Skipping battery expansion with invalid DIN format: {exp_din}")
+                            continue
+                        exp_part = exp_parts[0]
+                        exp_serial = exp_parts[1]
+                        exp_name = exp_serial  # Use serial number as key
+
+                        # Look up energy from vitals TEPOD entry
+                        tepod_key = f"TEPOD--{exp_din}"
+                        nominal_energy_remaining = lookup(vitals, [tepod_key, 'POD_nom_energy_remaining'])
+                        nominal_full_pack_energy = lookup(vitals, [tepod_key, 'POD_nom_full_pack_energy'])
+
+                        # Add expansion to blocks (expansions don't have inverter data)
+                        block[exp_name] = {
+                            "Type": "BatteryExpansion",
+                            "PackagePartNumber": exp_part,
+                            "PackageSerialNumber": exp_serial,
+                            "disabled_reasons": [],
+                            "pinv_state": None,
+                            "pinv_grid_state": None,
+                            "nominal_energy_remaining": nominal_energy_remaining,
+                            "nominal_full_pack_energy": nominal_full_pack_energy,
+                            "p_out": None,
+                            "q_out": None,
+                            "v_out": None,
+                            "f_out": None,
+                            "i_out": None,
+                            "energy_charged": None,
+                            "energy_discharged": None,
+                            "off_grid": None,
+                            "vf_mode": None,
+                            "wobble_detected": None,
+                            "charge_power_clamped": None,
+                            "backup_ready": None,
+                            "OpSeqState": None,
+                            "version": None
+                        }
+
+        return block
+
+    # ------------------------------------------------------------------
+    # Gateway Local API (classic /api/* endpoints via customer login)
+    # ------------------------------------------------------------------
+
+    def _customer_password(self) -> Optional[str]:
+        """
+        Customer password for the gateway local API.
+        Tesla derives it from the last 5 characters of the gateway password.
+        """
+        if self.v1r and self.v1r_transport is not None and self.v1r_transport.password:
+            return self.v1r_transport.password
+        if self.gw_pwd and len(self.gw_pwd) >= 5:
+            return self.gw_pwd[-5:]
+        return None
+
+    def _customer_login(self, host: str) -> bool:
+        """Login via POST /api/login/Basic and cache the Bearer token."""
+        password = self._customer_password()
+        if not password:
+            log.debug("No customer password available for gateway local API login")
+            return False
+        if self.api_session is None:
+            self.api_session = requests.Session()
+            self.api_session.verify = False
+        payload = {
+            "username": "customer",
+            "password": password,
+            "email": "nobody@nowhere.com",
+            "clientInfo": {"timezone": "UTC"},
+        }
+        try:
+            r = self.api_session.post(
+                f"https://{host}/api/login/Basic",
+                data=payload,
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            log.debug(f"Gateway local API login error on {host}: {e}")
+            return False
+        if r.status_code != HTTPStatus.OK:
+            log.debug(f"Gateway local API login failed ({r.status_code}) on {host}")
+            return False
+        try:
+            token = r.json().get("token")
+        except ValueError:
+            token = None
+        if not token:
+            return False
+        self.customer_token = token
+        self.customer_token_time = time.time()
+        self.customer_host = host
+        log.debug(f"Gateway local API login ok on {host}")
+        return True
+
+    def _native_get(self, host: str, path: str) -> Optional[Dict[Any, Any]]:
+        """GET a local API path with the cached customer Bearer token."""
+        for attempt in (1, 2):  # one retry with a fresh token on auth failure
+            if (
+                not self.customer_token
+                or self.customer_host != host
+                or time.time() - self.customer_token_time > CUSTOMER_TOKEN_EXPIRE
+            ):
+                if not self._customer_login(host):
+                    return None
+            if self.api_session is None:
+                self.api_session = requests.Session()
+                self.api_session.verify = False
+            try:
+                r = self.api_session.get(
+                    f"https://{host}{path}",
+                    headers={"Authorization": f"Bearer {self.customer_token}"},
+                    timeout=self.timeout,
+                )
+            except Exception as e:
+                log.debug(f"Gateway local API GET {path} on {host} error: {e}")
+                return None
+            if r.status_code == HTTPStatus.OK:
+                try:
+                    return r.json()
+                except ValueError:
+                    log.debug(f"Gateway local API GET {path} on {host} - non-JSON payload")
+                    return None
+            if r.status_code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN) and attempt == 1:
+                # Token may be stale or issued for a different host - retry once
+                self.customer_token = None
+                continue
+            log.debug(f"Gateway local API GET {path} on {host} -> {r.status_code} - not available")
+            return None
+        return None
+
+    def get_native_api(self, path: str) -> Optional[Dict[Any, Any]]:
+        """
+        Fetch a classic gateway local API endpoint (e.g. /api/meters/aggregates)
+        using the customer login (Bearer token). Tries the primary gateway and,
+        when configured and failover is on, the WiFi fallback host. Returns a
+        dict or None when the endpoint is not available on this firmware.
+        """
+        if not self._customer_password():
+            return None
+        hosts = [self.gw_ip]
+        if self.failover and self.wifi_host and self.wifi_host != self.gw_ip:
+            hosts.append(self.wifi_host)
+        if len(hosts) > 1:
+            if self.customer_host in hosts:
+                # Last host that served us goes first - a dead primary would
+                # otherwise cost a full timeout on every fetch
+                hosts.sort(key=lambda h: h != self.customer_host)
+            elif self.lan_failed:
+                hosts.reverse()
+        # Bounded acquisition - don't pile threads up behind a slow fetch
+        if not self._customer_lock.acquire(timeout=self.timeout):
+            log.debug(f"Gateway local API busy - skipping {path}")
+            return None
+        try:
+            for host in hosts:
+                try:
+                    data = self._native_get(host, path)
+                except Exception as e:
+                    log.debug(f"Gateway local API {path} on {host} failed: {e}")
+                    data = None
+                if data is not None:
+                    return data
+            return None
+        finally:
+            self._customer_lock.release()
+
+    def get_native_meters_aggregates(self, force: bool = False) -> Optional[Dict[Any, Any]]:
+        """
+        Fetch the gateway's native /api/meters/aggregates payload.
+
+        PW3 firmware (25.x+) still serves this endpoint behind the customer
+        Bearer token - including the lifetime energy_imported / energy_exported
+        accumulators that the TEDAPI payloads do not carry (issue #221).
+        Returns None when the endpoint is unavailable, with a retry backoff so
+        unsupported gateways are not hammered on every poll.
+        """
+        key = "native_meters_aggregates"
+        if not force:
+            if key in self.pwcachetime and time.time() - self.pwcachetime[key] < self.pwcacheexpire:
+                return self.pwcache.get(key)
+            if self._native_fail_until > time.time():
+                return self.pwcache.get(key)
+        # Bounded acquisition - on contention serve cached data instead of queuing
+        if not self._customer_lock.acquire(timeout=self.timeout):
+            log.debug("Gateway local API busy - returning cached aggregates")
+            return self.pwcache.get(key)
+        try:
+            # Double-check after acquiring - another thread may have refreshed
+            if not force:
+                if key in self.pwcachetime and \
+                        time.time() - self.pwcachetime[key] < self.pwcacheexpire:
+                    return self.pwcache.get(key)
+                if self._native_fail_until > time.time():
+                    return self.pwcache.get(key)
+            data = self.get_native_api("/api/meters/aggregates")
+            if isinstance(data, dict) and all(
+                isinstance(data.get(s), dict) for s in ("site", "battery", "load", "solar")
+            ):
+                self.pwcachetime[key] = time.time()
+                self.pwcache[key] = data
+                return data
+            # Endpoint missing/blocked - backoff before trying again
+            self._native_fail_until = time.time() + NATIVE_FAIL_RETRY
+            return None
+        finally:
+            self._customer_lock.release()
+
+    # End of TEDAPI Class
